@@ -1,0 +1,1580 @@
+import html
+import json
+import os
+from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+
+from app import db
+from app import scoring
+from app import optimization
+from app import extraction
+from app import rag
+from app import public_data
+from app import benchmark
+from app import risk
+from app import risk_detector
+
+
+def _utc_now():
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def _highlight_evidence(text, evidences, max_chars=4000):
+    if not text:
+        return ""
+    preview = html.escape(text[:max_chars])
+    for ev in evidences:
+        if not ev:
+            continue
+        ev_esc = html.escape(ev)
+        preview = preview.replace(ev_esc, f"<mark>{ev_esc}</mark>")
+    return preview
+
+
+def seed_defaults(conn):
+    def ensure_signal_definitions(defs):
+        existing = {d["key"] for d in db.list_signal_definitions(conn)}
+        missing = [d for d in defs if d["key"] not in existing]
+        if missing:
+            db.upsert_signal_definitions(conn, missing, actor="system")
+
+    base_defs = [
+        {
+            "key": "founder_exits",
+            "name": "Founder exits",
+            "description": "Number of prior exits across founding team",
+            "value_type": "number",
+            "unit": "count",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "founder_experience_years",
+            "name": "Founder experience (years)",
+            "description": "Total years of relevant experience",
+            "value_type": "number",
+            "unit": "years",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "traction_metric",
+            "name": "Traction metric",
+            "description": "Numeric traction signal (users, revenue, etc.)",
+            "value_type": "number",
+            "unit": "count",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "product_stage",
+            "name": "Product stage",
+            "description": "Idea, MVP, Beta, Live",
+            "value_type": "text",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "market_size_est",
+            "name": "Market size estimate",
+            "description": "Estimated TAM in USD",
+            "value_type": "number",
+            "unit": "usd",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+    ]
+    ensure_signal_definitions(base_defs)
+
+    public_defs = [
+        {
+            "key": "company_age_years",
+            "name": "Company age (years)",
+            "description": "Derived from incorporation date",
+            "value_type": "number",
+            "unit": "years",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "oc_is_active",
+            "name": "OpenCorporates active",
+            "description": "Active status from OpenCorporates",
+            "value_type": "bool",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "oc_status",
+            "name": "OpenCorporates status",
+            "description": "Current status text",
+            "value_type": "text",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "oc_jurisdiction",
+            "name": "OpenCorporates jurisdiction",
+            "description": "Jurisdiction code",
+            "value_type": "text",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "oc_company_number",
+            "name": "OpenCorporates company number",
+            "description": "Registry company number",
+            "value_type": "text",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "oc_officers_count",
+            "name": "OpenCorporates officers count",
+            "description": "Number of officers",
+            "value_type": "number",
+            "unit": "count",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "oc_filings_count",
+            "name": "OpenCorporates filings count",
+            "description": "Number of filings",
+            "value_type": "number",
+            "unit": "count",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "oc_incorporation_date",
+            "name": "OpenCorporates incorporation date",
+            "description": "Incorporation date",
+            "value_type": "text",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "sec_is_public",
+            "name": "SEC public company",
+            "description": "Company found in SEC filings",
+            "value_type": "bool",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "sec_latest_filing_date",
+            "name": "SEC latest filing date",
+            "description": "Most recent SEC filing date",
+            "value_type": "text",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "sec_filing_count_12m",
+            "name": "SEC filings (12m)",
+            "description": "Count of SEC filings in last 12 months",
+            "value_type": "number",
+            "unit": "count",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "sec_cik",
+            "name": "SEC CIK",
+            "description": "SEC CIK identifier",
+            "value_type": "text",
+            "unit": None,
+            "allowed_range_json": None,
+            "disabled": False,
+        },
+        {
+            "key": "news_volume",
+            "name": "News volume",
+            "description": "News volume from GDELT",
+            "value_type": "number",
+            "unit": "count",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "news_daily_avg",
+            "name": "News daily average",
+            "description": "News volume divided by days",
+            "value_type": "number",
+            "unit": "count",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "news_timespan_days",
+            "name": "News timespan (days)",
+            "description": "Timespan used for news query",
+            "value_type": "number",
+            "unit": "days",
+            "allowed_range_json": json.dumps({"min": 1}),
+            "disabled": False,
+        },
+    ]
+    ensure_signal_definitions(public_defs)
+
+    founder_material_defs = [
+        {
+            "key": "mrr",
+            "name": "MRR",
+            "description": "Monthly recurring revenue",
+            "value_type": "number",
+            "unit": "usd",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "arr",
+            "name": "ARR",
+            "description": "Annual recurring revenue",
+            "value_type": "number",
+            "unit": "usd",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "revenue_growth_rate",
+            "name": "Revenue growth rate",
+            "description": "Growth rate (percent)",
+            "value_type": "number",
+            "unit": "percent",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "churn_rate",
+            "name": "Churn rate",
+            "description": "Churn rate (percent)",
+            "value_type": "number",
+            "unit": "percent",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "gross_margin",
+            "name": "Gross margin",
+            "description": "Gross margin (percent)",
+            "value_type": "number",
+            "unit": "percent",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "burn_rate",
+            "name": "Burn rate",
+            "description": "Monthly burn rate",
+            "value_type": "number",
+            "unit": "usd",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "runway_months",
+            "name": "Runway (months)",
+            "description": "Cash runway in months",
+            "value_type": "number",
+            "unit": "months",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "cac",
+            "name": "CAC",
+            "description": "Customer acquisition cost",
+            "value_type": "number",
+            "unit": "usd",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "ltv",
+            "name": "LTV",
+            "description": "Customer lifetime value",
+            "value_type": "number",
+            "unit": "usd",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "payback_months",
+            "name": "Payback (months)",
+            "description": "CAC payback period",
+            "value_type": "number",
+            "unit": "months",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "funding_raised",
+            "name": "Funding raised",
+            "description": "Total funding raised",
+            "value_type": "number",
+            "unit": "usd",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+        {
+            "key": "valuation",
+            "name": "Valuation",
+            "description": "Company valuation",
+            "value_type": "number",
+            "unit": "usd",
+            "allowed_range_json": json.dumps({"min": 0}),
+            "disabled": False,
+        },
+    ]
+    ensure_signal_definitions(founder_material_defs)
+
+    composite_defs = [
+        {
+            "key": "growth_momentum",
+            "name": "Growth momentum",
+            "description": "Composite of news change, hiring velocity, and launches",
+            "value_type": "number",
+            "unit": "score",
+            "allowed_range_json": json.dumps({"min": 0, "max": 1}),
+            "disabled": False,
+        },
+        {
+            "key": "market_validation",
+            "name": "Market validation",
+            "description": "Composite of revenue growth, customer count, and press coverage",
+            "value_type": "number",
+            "unit": "score",
+            "allowed_range_json": json.dumps({"min": 0, "max": 1}),
+            "disabled": False,
+        },
+        {
+            "key": "team_quality",
+            "name": "Team quality",
+            "description": "Composite of founder experience, advisor prestige, and hiring success",
+            "value_type": "number",
+            "unit": "score",
+            "allowed_range_json": json.dumps({"min": 0, "max": 1}),
+            "disabled": False,
+        },
+    ]
+    ensure_signal_definitions(composite_defs)
+
+    # Seed criteria if empty
+    version_id = db.get_active_criteria_version_id(conn)
+    criteria_rows = db.list_criteria(conn, version_id)
+    if len(criteria_rows) == 0:
+        now = _utc_now()
+        cur = conn.cursor()
+        seed_criteria = [
+            {
+                "name": "Founder exits",
+                "description": "At least 1 prior exit",
+                "signal_key": "founder_exits",
+                "weight": 0.12,
+                "enabled": 1,
+                "scoring_method": "binary",
+                "params_json": json.dumps({"op": "gte", "threshold": 1}),
+                "missing_policy": "zero",
+            },
+            {
+                "name": "Founder experience",
+                "description": "10+ years experience",
+                "signal_key": "founder_experience_years",
+                "weight": 0.12,
+                "enabled": 1,
+                "scoring_method": "binary",
+                "params_json": json.dumps({"op": "gte", "threshold": 10}),
+                "missing_policy": "zero",
+            },
+            {
+                "name": "Traction signal",
+                "description": "Traction >= 1000",
+                "signal_key": "traction_metric",
+                "weight": 0.12,
+                "enabled": 1,
+                "scoring_method": "binary",
+                "params_json": json.dumps({"op": "gte", "threshold": 1000}),
+                "missing_policy": "zero",
+            },
+            {
+                "name": "Product stage",
+                "description": "At least MVP",
+                "signal_key": "product_stage",
+                "weight": 0.10,
+                "enabled": 1,
+                "scoring_method": "binary",
+                "params_json": json.dumps({"op": "contains", "threshold": "mvp"}),
+                "missing_policy": "zero",
+            },
+            {
+                "name": "Market size",
+                "description": "TAM >= $1B",
+                "signal_key": "market_size_est",
+                "weight": 0.10,
+                "enabled": 1,
+                "scoring_method": "binary",
+                "params_json": json.dumps({"op": "gte", "threshold": 1000000000}),
+                "missing_policy": "zero",
+            },
+        ]
+        for c in seed_criteria:
+            cur.execute(
+                """
+                INSERT INTO criteria (
+                    criteria_set_version_id, name, description, signal_key, weight,
+                    enabled, scoring_method, params_json, missing_policy, created_at, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version_id,
+                    c["name"],
+                    c["description"],
+                    c["signal_key"],
+                    c["weight"],
+                    c["enabled"],
+                    c["scoring_method"],
+                    c["params_json"],
+                    c["missing_policy"],
+                    now,
+                    "system",
+                ),
+            )
+        conn.commit()
+
+
+def page_dashboard(conn):
+    st.title("AI Sourcing MVP")
+    companies = db.list_companies(conn)
+    st.metric("Companies", len(companies))
+    latest_scores = db.list_latest_score_summary(conn)
+    if latest_scores:
+        top = [r for r in latest_scores if r["total_score"] is not None][:5]
+        if top:
+            st.subheader("Top Companies")
+            st.dataframe(pd.DataFrame(top)[["name", "total_score", "website"]])
+
+
+def page_companies(conn):
+    st.header("Companies")
+    if st.button("Run scoring for all companies"):
+        version_id = db.get_active_criteria_version_id(conn)
+        scoring.run_scoring(conn, version_id)
+        st.success("Scoring complete")
+
+    rows = db.list_latest_score_summary(conn)
+    if rows:
+        df = pd.DataFrame(rows)
+        st.dataframe(df[["id", "name", "website", "industry", "location", "total_score", "scored_at"]])
+    else:
+        st.info("No companies yet. Upload a CSV in Upload/Crawl.")
+
+
+def page_company_detail(conn):
+    st.header("Company Detail")
+    companies = db.list_companies(conn)
+    if not companies:
+        st.info("No companies yet.")
+        return
+
+    company_map = {f"{c['name']} (#{c['id']})": c["id"] for c in companies}
+    selection = st.selectbox("Select company", list(company_map.keys()))
+    company_id = company_map[selection]
+    company = db.get_company(conn, company_id)
+
+    st.subheader(company["name"])
+    st.write(company["description"] or "No description")
+    st.write(f"Website: {company['website'] or 'N/A'}")
+    st.write(f"Industry: {company['industry'] or 'N/A'}")
+    st.write(f"Location: {company['location'] or 'N/A'}")
+    st.write(f"Founders: {company['founder_names'] or 'N/A'}")
+
+    rating = db.list_latest_rating(conn, company_id)
+    current_rating = rating["rating_int"] if rating else 3
+    new_rating = st.slider("Rating (1–5)", 1, 5, int(current_rating))
+    if st.button("Save rating"):
+        db.add_rating(conn, company_id, new_rating)
+        st.success("Rating saved")
+
+    st.subheader("Latest Signals")
+    signals = db.list_latest_signal_values(conn, company_id)
+    if signals:
+        st.dataframe(
+            pd.DataFrame(signals)[
+                [
+                    "signal_key",
+                    "value_num",
+                    "value_text",
+                    "value_bool",
+                    "value_json",
+                    "confidence",
+                    "evidence_text",
+                    "evidence_page",
+                    "source_type",
+                    "observed_at",
+                ]
+            ]
+        )
+    else:
+        st.info("No signals yet for this company.")
+
+    st.subheader("Score Breakdown")
+    score_item = db.list_latest_score_item(conn, company_id)
+    if score_item:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Normalized Score", round(score_item["normalized_total"] or score_item["total_score"] or 0.0, 4))
+        col2.metric("Raw Score", round(score_item["raw_total"] or 0.0, 4))
+        col3.metric("Weight Used", round(score_item["weight_used"] or 0.0, 4))
+        components = db.list_score_components(conn, company_id)
+        if components:
+            st.dataframe(
+                pd.DataFrame(components)[
+                    [
+                        "criterion_name",
+                        "raw_score",
+                        "weight",
+                        "contribution",
+                        "signal_confidence",
+                        "signal_evidence_page",
+                        "signal_evidence",
+                        "explanation",
+                    ]
+                ]
+            )
+    else:
+        st.info("No scores yet. Run scoring in Companies page.")
+
+    st.subheader("Benchmark Results (Latest Run)")
+    bench_rows = db.list_latest_benchmark_results(conn, company_id)
+    if bench_rows:
+        st.dataframe(
+            pd.DataFrame(bench_rows)[
+                [
+                    "metric_key",
+                    "metric_value",
+                    "percentile_band",
+                    "vs_median",
+                    "sector",
+                    "stage",
+                    "geo",
+                ]
+            ]
+        )
+    else:
+        st.info("No benchmark results yet. Run Benchmarking.")
+
+    st.subheader("Intelligent Risk (Latest Run)")
+    risk_item = db.get_latest_risk_run_item(conn, company_id)
+    if risk_item:
+        st.metric("Risk Score", f\"{risk_item['risk_score']:.2f}\", risk_item[\"risk_level\"].title())
+        risk_flags = db.list_latest_risk_flags(conn, company_id)
+        if risk_flags:
+            st.dataframe(
+                pd.DataFrame(risk_flags)[
+                    [
+                        \"category\",
+                        \"risk_type\",
+                        \"severity\",
+                        \"confidence\",
+                        \"description\",
+                        \"evidence_text\",
+                        \"source_ref\",
+                        \"evidence_page\",
+                        \"method\",
+                    ]
+                ]
+            )
+        else:
+            st.info(\"No risk flags in latest intelligent scan.\")
+    else:
+        st.info(\"No intelligent risk scans yet. Run Risk Detection.\")
+
+
+def page_signals_manager(conn):
+    st.header("Signals Manager")
+    tabs = st.tabs(["Signal Definitions", "Signal Values"])
+
+    with tabs[0]:
+        st.subheader("Definitions")
+        defs = db.list_signal_definitions(conn)
+        if defs:
+            df = pd.DataFrame(defs)
+        else:
+            df = pd.DataFrame(columns=["key", "name", "description", "value_type", "unit", "allowed_range_json", "disabled"])
+        editor = st.data_editor(
+            df[["key", "name", "description", "value_type", "unit", "allowed_range_json", "disabled"]],
+            num_rows="dynamic",
+            use_container_width=True,
+        )
+        if st.button("Save definitions"):
+            records = editor.fillna("").to_dict(orient="records")
+            cleaned = []
+            for r in records:
+                if not r.get("key"):
+                    continue
+                cleaned.append({
+                    "key": r.get("key").strip(),
+                    "name": r.get("name") or r.get("key"),
+                    "description": r.get("description"),
+                    "value_type": r.get("value_type") or "text",
+                    "unit": r.get("unit"),
+                    "allowed_range_json": r.get("allowed_range_json"),
+                    "disabled": bool(r.get("disabled")),
+                })
+            db.upsert_signal_definitions(conn, cleaned)
+            st.success("Definitions saved")
+
+    with tabs[1]:
+        st.subheader("Values")
+        companies = db.list_companies(conn)
+        if not companies:
+            st.info("No companies available.")
+            return
+        company_map = {f"{c['name']} (#{c['id']})": c["id"] for c in companies}
+        company_selection = st.selectbox("Select company", list(company_map.keys()))
+        company_id = company_map[company_selection]
+
+        st.write("Latest signal values")
+        latest = db.list_latest_signal_values(conn, company_id)
+        if latest:
+            st.dataframe(
+                pd.DataFrame(latest)[
+                    [
+                        "signal_key",
+                        "value_num",
+                        "value_text",
+                        "value_bool",
+                        "value_json",
+                        "confidence",
+                        "evidence_text",
+                        "evidence_page",
+                        "source_type",
+                        "observed_at",
+                    ]
+                ]
+            )
+
+        defs = db.list_signal_definitions(conn)
+        if defs:
+            signal_keys = [d["key"] for d in defs if not d["disabled"]]
+        else:
+            signal_keys = []
+        if signal_keys:
+            signal_key = st.selectbox("Signal key", signal_keys)
+            selected_def = next((d for d in defs if d["key"] == signal_key), None)
+            value_type = selected_def["value_type"] if selected_def else "text"
+
+            value_num = None
+            value_text = None
+            value_bool = None
+            value_json = None
+
+            if value_type == "number":
+                value_num = st.number_input("Value (number)", value=0.0, step=1.0)
+            elif value_type == "bool":
+                value_bool = st.checkbox("Value (bool)")
+            elif value_type == "json":
+                value_json = st.text_area("Value (json)", value="{}")
+            else:
+                value_text = st.text_input("Value (text)")
+
+            source_ref = st.text_input("Source reference (optional)")
+            confidence_input = st.text_input("Confidence (0-1, optional)")
+            evidence_input = st.text_input("Evidence (optional)")
+            evidence_page_input = st.text_input("Evidence page (optional)")
+            if st.button("Add signal value"):
+                if value_type == "json":
+                    try:
+                        json.loads(value_json or "{}")
+                    except json.JSONDecodeError:
+                        st.error("Invalid JSON")
+                        return
+                confidence = None
+                if confidence_input:
+                    try:
+                        confidence = max(0.0, min(1.0, float(confidence_input)))
+                    except ValueError:
+                        st.error("Confidence must be a number between 0 and 1")
+                        return
+                evidence_page = None
+                if evidence_page_input:
+                    try:
+                        evidence_page = int(evidence_page_input)
+                    except ValueError:
+                        st.error("Evidence page must be an integer")
+                        return
+                db.add_signal_value(
+                    conn,
+                    company_id,
+                    signal_key,
+                    value_num,
+                    value_text,
+                    1 if value_bool else 0 if value_type == "bool" else None,
+                    value_json,
+                    "manual",
+                    source_ref or None,
+                    confidence=confidence,
+                    evidence_text=evidence_input or None,
+                    evidence_page=evidence_page,
+                )
+                st.success("Signal value added")
+
+        st.subheader("Signal history")
+        history_key = st.selectbox("History for signal key", signal_keys if signal_keys else [])
+        if history_key:
+            history = db.list_signal_history(conn, company_id, history_key)
+            if history:
+                st.dataframe(
+                    pd.DataFrame(history)[
+                        [
+                            "signal_key",
+                            "value_num",
+                            "value_text",
+                            "value_bool",
+                            "value_json",
+                            "confidence",
+                            "evidence_text",
+                            "evidence_page",
+                            "source_type",
+                            "observed_at",
+                        ]
+                    ]
+                )
+
+
+def _validate_params_json(params_json):
+    if not params_json:
+        return True, None
+    try:
+        json.loads(params_json)
+        return True, None
+    except json.JSONDecodeError as exc:
+        return False, str(exc)
+
+
+def page_criteria_manager(conn):
+    st.header("Criteria Manager")
+
+    version_id = db.get_active_criteria_version_id(conn)
+    versions = db.list_criteria_versions(conn)
+    current_version = next((v for v in versions if v["id"] == version_id), None)
+    if current_version:
+        st.caption(f"Active version: v{current_version['version']} ({current_version['created_at']})")
+
+    criteria = db.list_criteria(conn, version_id)
+    if criteria:
+        df = pd.DataFrame(criteria)
+    else:
+        df = pd.DataFrame(columns=[
+            "name",
+            "description",
+            "signal_key",
+            "weight",
+            "enabled",
+            "scoring_method",
+            "params_json",
+            "missing_policy",
+        ])
+
+    editor = st.data_editor(
+        df[["name", "description", "signal_key", "weight", "enabled", "scoring_method", "params_json", "missing_policy"]],
+        num_rows="dynamic",
+        use_container_width=True,
+    )
+
+    if st.button("Save as new version"):
+        records = editor.fillna("").to_dict(orient="records")
+        cleaned = []
+        for r in records:
+            if not r.get("name") or not r.get("signal_key"):
+                continue
+            valid, err = _validate_params_json(r.get("params_json"))
+            if not valid:
+                st.error(f"Invalid params_json for {r.get('name')}: {err}")
+                return
+            cleaned.append({
+                "name": r.get("name"),
+                "description": r.get("description"),
+                "signal_key": r.get("signal_key"),
+                "weight": float(r.get("weight") or 0),
+                "enabled": bool(r.get("enabled")),
+                "scoring_method": r.get("scoring_method") or "binary",
+                "params_json": r.get("params_json") or "{}",
+                "missing_policy": r.get("missing_policy") or "zero",
+            })
+        new_version_id = db.replace_criteria_version(conn, version_id, cleaned)
+        st.success(f"Saved new version (id {new_version_id})")
+
+    st.subheader("Previous versions")
+    if versions:
+        version_df = pd.DataFrame(versions)
+        st.dataframe(version_df[["id", "version", "created_at", "notes", "active_version_id"]])
+
+
+def page_upload_crawl(conn):
+    st.header("Upload / Crawl")
+    st.subheader("Upload CSV")
+    st.caption("Expected columns: name, website, description, industry, location, founder_names")
+    file = st.file_uploader("Upload CSV", type=["csv"])
+    if file is not None:
+        df = pd.read_csv(file)
+        added = 0
+        for _, row in df.iterrows():
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            db.add_company(
+                conn,
+                name=name,
+                website=row.get("website"),
+                description=row.get("description"),
+                industry=row.get("industry"),
+                location=row.get("location"),
+                founder_names=row.get("founder_names"),
+                source="upload",
+            )
+            added += 1
+        st.success(f"Added {added} companies")
+
+    st.subheader("AI Signal Extraction from Website")
+    st.caption("Requires OPENAI_API_KEY and an OpenAI model name (default: gpt-4o-mini).")
+    with st.expander("Quick add company from URL"):
+        quick_url = st.text_input("New company website URL", key="quick_add_url")
+        if st.button("Add company", key="quick_add_btn"):
+            if quick_url:
+                name = quick_url.replace("https://", "").replace("http://", "").split("/")[0]
+                db.add_company(conn, name=name, website=quick_url, source="crawl")
+                st.success("Company created. Select it below.")
+            else:
+                st.error("Please enter a URL")
+
+    companies = db.list_companies(conn)
+    if not companies:
+        st.info("Add at least one company to attach extracted signals.")
+        return
+
+    company_map = {f"{c['name']} (#{c['id']})": c["id"] for c in companies}
+    company_selection = st.selectbox("Select company", list(company_map.keys()))
+    company_id = company_map[company_selection]
+    company = db.get_company(conn, company_id)
+
+    default_url = company["website"] or ""
+    url = st.text_input("Company website URL", value=default_url)
+    model = st.text_input("OpenAI model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    max_pages = st.slider("Max pages to crawl", min_value=1, max_value=10, value=5)
+    same_domain = st.checkbox("Only crawl same domain", value=True)
+
+    if st.button("Fetch & extract signals"):
+        if not url:
+            st.error("Please enter a URL")
+        else:
+            try:
+                text, pages = extraction.crawl_site_text(url, max_pages=max_pages, same_domain=same_domain)
+                if not text:
+                    st.error("Could not extract readable text from the website")
+                else:
+                    defs = db.list_signal_definitions(conn)
+                    signals = extraction.extract_signals_with_openai(text, defs, model=model)
+                    st.session_state["extracted_signals"] = signals
+                    st.session_state["extraction_url"] = url
+                    st.session_state["extraction_company_id"] = company_id
+                    st.session_state["extraction_text"] = text
+                    st.session_state["extraction_pages"] = pages
+                    st.success("Signals extracted. Review below and save.")
+            except Exception as exc:
+                st.error(f"Extraction failed: {exc}")
+
+    extracted = st.session_state.get("extracted_signals")
+    if extracted:
+        st.subheader("Extracted Signals")
+        rows = []
+        evidences = []
+        for key, payload in extracted.items():
+            value = payload.get("value") if isinstance(payload, dict) else payload
+            confidence = payload.get("confidence") if isinstance(payload, dict) else None
+            evidence = payload.get("evidence") if isinstance(payload, dict) else None
+            rows.append(
+                {
+                    "signal_key": key,
+                    "value": value,
+                    "confidence": confidence,
+                    "evidence": evidence,
+                }
+            )
+            if evidence:
+                evidences.append(str(evidence))
+
+        st.dataframe(pd.DataFrame(rows)[["signal_key", "value", "confidence", "evidence"]])
+
+        if evidences:
+            st.subheader("Evidence Highlights")
+            for row in rows:
+                if row["evidence"]:
+                    conf = row.get("confidence")
+                    conf_display = f"{conf:.2f}" if isinstance(conf, (int, float)) else "N/A"
+                    st.markdown(
+                        f"**{row['signal_key']}** – confidence {conf_display}\n\n<mark>{html.escape(str(row['evidence']))}</mark>",
+                        unsafe_allow_html=True,
+                    )
+
+        source_text = st.session_state.get("extraction_text")
+        if source_text:
+            with st.expander("Source text preview (highlighted)"):
+                highlighted = _highlight_evidence(source_text, evidences)
+                st.markdown(
+                    f"<div style='white-space: pre-wrap'>{highlighted}</div>",
+                    unsafe_allow_html=True,
+                )
+        pages = st.session_state.get("extraction_pages") or []
+        if pages:
+            with st.expander("Pages crawled"):
+                for page in pages:
+                    st.write(page)
+
+        if st.button("Save extracted signals"):
+            defs = db.list_signal_definitions(conn)
+            def_map = {d["key"]: d for d in defs}
+            saved = 0
+            pages = st.session_state.get("extraction_pages") or []
+            notes = f"model={model};pages={len(pages)}"
+            for key, payload in extracted.items():
+                if key not in def_map:
+                    continue
+                d = def_map[key]
+                value_num, value_text, value_bool, value_json, confidence, evidence, evidence_page = extraction.normalize_extracted_signal(
+                    payload, d["value_type"]
+                )
+                raw_value = payload.get("value") if isinstance(payload, dict) else payload
+                if raw_value is None:
+                    continue
+                db.add_signal_value(
+                    conn,
+                    st.session_state["extraction_company_id"],
+                    key,
+                    value_num,
+                    value_text,
+                    value_bool,
+                    value_json,
+                    source_type="model",
+                    source_ref=st.session_state.get("extraction_url"),
+                    notes=notes,
+                    confidence=confidence,
+                    evidence_text=evidence,
+                    evidence_page=evidence_page,
+                )
+                saved += 1
+            st.success(f"Saved {saved} extracted signals")
+            st.session_state.pop("extracted_signals", None)
+            st.session_state.pop("extraction_text", None)
+            st.session_state.pop("extraction_pages", None)
+
+
+    st.subheader("Founder Materials Upload & Extraction (RAG)")
+    st.caption("Supported: PDF, TXT, EML, DOCX, PPTX. Files are stored in data/uploads/.")
+    files = st.file_uploader("Upload founder materials", type=["pdf", "txt", "eml", "docx", "pptx"], accept_multiple_files=True, key="fm_upload")
+    col1, col2 = st.columns(2)
+    add_global = col1.checkbox("Add to global library", value=False, key="fm_global")
+    link_company = col2.checkbox("Link to selected company", value=True, key="fm_link")
+
+    fm_company_id = None
+    if link_company:
+        fm_company_selection = st.selectbox("Company to link", list(company_map.keys()), key="fm_company")
+        fm_company_id = company_map[fm_company_selection]
+
+    if st.button("Process founder materials", key="process_fm"):
+        if not files:
+            st.error("Please upload at least one file")
+        elif not add_global and not link_company:
+            st.error("Select at least one: global library or company link")
+        else:
+            processed = 0
+            for file_obj in files:
+                doc_type = rag.detect_doc_type(file_obj.name)
+                if doc_type == "unknown":
+                    st.warning(f"Unsupported file type: {file_obj.name}")
+                    continue
+                try:
+                    doc_id, pages, chunks = rag.store_document(
+                        conn,
+                        file_obj,
+                        file_obj.name,
+                        doc_type=doc_type,
+                        source_type="founder_material",
+                        is_global=add_global,
+                        company_id=fm_company_id,
+                    )
+                    st.success(f"Stored {file_obj.name} as document #{doc_id} ({pages} pages, {chunks} chunks)")
+                    processed += 1
+                except Exception as exc:
+                    st.error(f"Failed to process {file_obj.name}: {exc}")
+            if processed:
+                st.success(f"Processed {processed} founder materials")
+
+    st.subheader("Extract Signals from Founder Materials (RAG)")
+    fm_extract_company = st.selectbox("Company for founder-material extraction", list(company_map.keys()), key="fm_extract_company")
+    fm_company_id = company_map[fm_extract_company]
+    top_k = st.slider("Top chunks to use", min_value=3, max_value=15, value=8, key="fm_topk")
+
+    if st.button("Retrieve + extract from founder materials", key="extract_fm"):
+        try:
+            chunks = rag.get_company_chunks(conn, fm_company_id, source_types=["founder_material"])
+            if not chunks:
+                st.error("No founder-material chunks found for this company. Upload files first.")
+            else:
+                defs = db.list_signal_definitions(conn)
+                query = rag.build_query_from_signals(defs)
+                top_chunks = rag.retrieve_top_chunks(chunks, query, top_k=top_k)
+                if not top_chunks:
+                    st.error("No relevant chunks found. Try increasing top_k or add more documents.")
+                else:
+                    context = rag.build_context(top_chunks)
+                    signals = extraction.extract_signals_with_openai(context, defs, model=model)
+                    st.session_state["fm_extracted_signals"] = signals
+                    st.session_state["fm_context"] = context
+                    st.session_state["fm_chunks"] = top_chunks
+                    st.session_state["fm_company_id"] = fm_company_id
+                    st.success("Founder-material signals extracted. Review below and save.")
+        except Exception as exc:
+            st.error(f"Founder-material extraction failed: {exc}")
+
+    fm_extracted = st.session_state.get("fm_extracted_signals")
+    if fm_extracted:
+        st.subheader("Extracted Signals (Founder Materials)")
+        fm_rows = []
+        fm_evidences = []
+        for key, payload in fm_extracted.items():
+            value = payload.get("value") if isinstance(payload, dict) else payload
+            confidence = payload.get("confidence") if isinstance(payload, dict) else None
+            evidence = payload.get("evidence") if isinstance(payload, dict) else None
+            page = payload.get("page") if isinstance(payload, dict) else None
+            fm_rows.append(
+                {
+                    "signal_key": key,
+                    "value": value,
+                    "confidence": confidence,
+                    "evidence": evidence,
+                    "page": page,
+                }
+            )
+            if evidence:
+                fm_evidences.append(str(evidence))
+
+        st.dataframe(pd.DataFrame(fm_rows)[["signal_key", "value", "confidence", "evidence", "page"]])
+
+        if fm_evidences:
+            st.subheader("Founder Materials Evidence Highlights")
+            for row in fm_rows:
+                if row["evidence"]:
+                    conf = row.get("confidence")
+                    conf_display = f"{conf:.2f}" if isinstance(conf, (int, float)) else "N/A"
+                    st.markdown(
+                        f"**{row['signal_key']}** – confidence {conf_display} (page {row.get('page')})\n\n<mark>{html.escape(str(row['evidence']))}</mark>",
+                        unsafe_allow_html=True,
+                    )
+
+        fm_context = st.session_state.get("fm_context")
+        if fm_context:
+            with st.expander("Founder materials context preview (highlighted)"):
+                highlighted = _highlight_evidence(fm_context, fm_evidences)
+                st.markdown(
+                    f"<div style='white-space: pre-wrap'>{highlighted}</div>",
+                    unsafe_allow_html=True,
+                )
+
+        fm_chunks = st.session_state.get("fm_chunks") or []
+        if fm_chunks:
+            with st.expander("Top chunks used"):
+                chunk_rows = [
+                    {
+                        "filename": ch.get("filename"),
+                        "page": ch.get("page_num"),
+                        "chunk_index": ch.get("chunk_index"),
+                        "doc_type": ch.get("doc_type"),
+                    }
+                    for ch in fm_chunks
+                ]
+                st.dataframe(pd.DataFrame(chunk_rows))
+
+        if st.button("Save extracted founder-material signals", key="save_fm_signals"):
+            defs = db.list_signal_definitions(conn)
+            def_map = {d["key"]: d for d in defs}
+            saved = 0
+            fm_chunks = st.session_state.get("fm_chunks") or []
+            doc_ids = sorted({ch.get("document_id") for ch in fm_chunks if ch.get("document_id")})
+            notes = f"model={model};docs={','.join(map(str, doc_ids))}"
+            for key, payload in fm_extracted.items():
+                if key not in def_map:
+                    continue
+                d = def_map[key]
+                value_num, value_text, value_bool, value_json, confidence, evidence, evidence_page = extraction.normalize_extracted_signal(
+                    payload, d["value_type"]
+                )
+                raw_value = payload.get("value") if isinstance(payload, dict) else payload
+                if raw_value is None:
+                    continue
+                db.add_signal_value(
+                    conn,
+                    st.session_state["fm_company_id"],
+                    key,
+                    value_num,
+                    value_text,
+                    value_bool,
+                    value_json,
+                    source_type="founder_material",
+                    source_ref="founder_material",
+                    notes=notes,
+                    confidence=confidence,
+                    evidence_text=evidence,
+                    evidence_page=evidence_page,
+                )
+                saved += 1
+            st.success(f"Saved {saved} extracted signals from founder materials")
+            st.session_state.pop("fm_extracted_signals", None)
+            st.session_state.pop("fm_context", None)
+            st.session_state.pop("fm_chunks", None)
+
+
+def page_optimization(conn):
+    st.header("Optimization")
+    st.caption("Uses your 1–5 ratings to suggest updated criteria weights (manual approval required).")
+
+    ratings = db.list_latest_ratings(conn)
+    defs = db.list_signal_definitions(conn)
+    numeric_defs = [d for d in defs if d["disabled"] == 0 and d["value_type"] in ("number", "bool")]
+
+    col1, col2 = st.columns(2)
+    col1.metric("Rated companies", len(ratings))
+    col2.metric("Numeric/bool signals", len(numeric_defs))
+
+    version_id = db.get_active_criteria_version_id(conn)
+
+    if st.button("Run optimization"):
+        result, err = optimization.run_optimization(conn, version_id)
+        if err:
+            st.error(err)
+        else:
+            st.session_state["opt_run_id"] = result.run_id
+            st.success("Optimization complete")
+
+    runs = db.list_optimization_runs(conn)
+    if runs:
+        st.subheader("Runs")
+        runs_df = pd.DataFrame(runs)
+        st.dataframe(runs_df[["id", "criteria_set_version_id", "model_type", "rows_used", "created_at"]])
+
+    run_id = st.session_state.get("opt_run_id")
+    if runs:
+        run_options = [r["id"] for r in runs]
+        if run_id not in run_options:
+            run_id = run_options[0]
+        run_id = st.selectbox("View run", run_options, index=run_options.index(run_id))
+
+        run_row = next((r for r in runs if r["id"] == run_id), None)
+        if run_row and run_row["metrics_json"]:
+            try:
+                metrics = json.loads(run_row["metrics_json"])
+                st.write(f"MAE: {metrics.get('mae'):.3f} | R²: {metrics.get('r2'):.3f}")
+            except Exception:
+                pass
+
+    if run_id:
+        suggestions = db.list_optimization_suggestions(conn, run_id)
+        if suggestions:
+            st.subheader(f"Suggestions (Run #{run_id})")
+            suggestions_df = pd.DataFrame(suggestions)
+            suggestions_df["accept"] = suggestions_df["accepted"].fillna(0).astype(int).astype(bool)
+
+            editor = st.data_editor(
+                suggestions_df[
+                    [
+                        "accept",
+                        "criterion_name",
+                        "signal_key",
+                        "current_weight",
+                        "suggested_weight",
+                        "delta",
+                        "confidence",
+                        "notes",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+            if st.button("Apply selected suggestions"):
+                accepted_ids = suggestions_df.loc[editor["accept"] == True, "id"].tolist()
+                db.mark_suggestions(conn, run_id, accepted_ids)
+                new_version_id = db.apply_optimization_suggestions(conn, run_id, accepted_ids)
+                if new_version_id:
+                    st.success(f"Applied {len(accepted_ids)} suggestions. New criteria version: {new_version_id}")
+                else:
+                    st.error("No suggestions applied.")
+        else:
+            st.info("No suggestions available for this run yet.")
+
+
+
+
+def page_benchmarking(conn):
+    st.header("Benchmarking")
+    st.caption("Upload a peer dataset CSV with columns: sector, stage, geo (optional), and numeric metrics like mrr, arr, churn_rate, etc.")
+
+    upload = st.file_uploader("Upload benchmark CSV", type=["csv"], key="benchmark_upload")
+    bench_name = st.text_input("Benchmark set name", value="Default Benchmarks")
+    bench_desc = st.text_input("Description", value="")
+
+    if upload is not None:
+        df = pd.read_csv(upload)
+        st.write("Preview")
+        st.dataframe(df.head(10))
+
+        columns = df.columns.tolist()
+        sector_col = st.selectbox("Sector column", options=columns, index=columns.index("sector") if "sector" in columns else 0)
+        stage_col = st.selectbox("Stage column", options=columns, index=columns.index("stage") if "stage" in columns else 0)
+        geo_col = st.selectbox("Geo column (optional)", options=[""] + columns, index=(columns.index("geo") + 1) if "geo" in columns else 0)
+
+        non_metric = {sector_col, stage_col}
+        if geo_col:
+            non_metric.add(geo_col)
+        metric_cols = [c for c in columns if c not in non_metric and pd.api.types.is_numeric_dtype(df[c])]
+        metric_selection = st.multiselect("Metric columns", options=metric_cols, default=metric_cols)
+
+        if st.button("Create benchmark set"):
+            if not metric_selection:
+                st.error("Select at least one metric column")
+            else:
+                group_cols = ["sector", "stage"]
+                df = df.rename(columns={sector_col: "sector", stage_col: "stage"})
+                if geo_col:
+                    df = df.rename(columns={geo_col: "geo"})
+                    group_cols.append("geo")
+                else:
+                    df["geo"] = None
+
+                stats_rows = benchmark.compute_benchmark_stats(df, group_cols, metric_selection)
+                if not stats_rows:
+                    st.error("No benchmark stats computed. Check your data.")
+                else:
+                    set_id = db.create_benchmark_set(conn, bench_name, bench_desc)
+                    db.add_benchmark_stats(conn, set_id, stats_rows)
+                    st.success(f"Created benchmark set #{set_id} with {len(stats_rows)} stats rows")
+
+    st.subheader("Run Benchmarking")
+    sets = db.list_benchmark_sets(conn)
+    if not sets:
+        st.info("No benchmark sets yet. Upload a CSV above.")
+        return
+
+    set_map = {f"{s['name']} (#{s['id']})": s["id"] for s in sets}
+    set_sel = st.selectbox("Benchmark set", list(set_map.keys()))
+    set_id = set_map[set_sel]
+
+    if st.button("Run benchmarking"):
+        run_id, err = benchmark.run_benchmark(conn, set_id)
+        if err:
+            st.error(err)
+        else:
+            st.success(f"Benchmark run completed (id {run_id})")
+
+
+def page_risk_detection(conn):
+    st.header("Risk Detection")
+    st.caption("Intelligent red flag detection with rules, anomalies, patterns, cross-source checks, and LLM.")
+
+    model = st.text_input("OpenAI model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    ai_budget = st.number_input("AI budget per company (USD)", min_value=0.0, max_value=5.0, value=0.2, step=0.05)
+    enable_llm = st.checkbox("Enable LLM text risk extraction", value=True)
+
+    if st.button("Run intelligent risk scan"):
+        engine = risk_detector.RiskDetectionEngine(conn, model=model, ai_budget_usd=ai_budget, enable_llm=enable_llm)
+        run_id, err = engine.run_scan()
+        if err:
+            st.error(err)
+        else:
+            st.success(f"Intelligent risk scan completed (id {run_id})")
+
+    companies = db.list_companies(conn)
+    if not companies:
+        st.info("No companies yet.")
+        return
+
+    company_map = {f"{c['name']} (#{c['id']})": c["id"] for c in companies}
+    selection = st.selectbox("View findings for company", list(company_map.keys()), key="risk_company")
+    company_id = company_map[selection]
+    run_item = db.get_latest_risk_run_item(conn, company_id)
+    if run_item:
+        st.metric("Risk Score", f\"{run_item['risk_score']:.2f}\", run_item[\"risk_level\"].title())
+
+    flags = db.list_latest_risk_flags(conn, company_id)
+    if flags:
+        st.dataframe(
+            pd.DataFrame(flags)[
+                [
+                    \"category\",
+                    \"risk_type\",
+                    \"severity\",
+                    \"confidence\",
+                    \"description\",
+                    \"evidence_text\",
+                    \"source_ref\",
+                    \"evidence_page\",
+                    \"method\",
+                ]
+            ]
+        )
+    else:
+        st.info("No risk flags for this company in the latest intelligent run.")
+
+    report = db.get_risk_report(conn, company_id)
+    if report:
+        st.download_button(
+            "Export Risk Report (JSON)",
+            data=json.dumps(report, indent=2),
+            file_name=f\"risk_report_company_{company_id}.json\",\n            mime=\"application/json\",\n        )
+
+
+def page_public_data(conn):
+    st.header("Public Data")
+    companies = db.list_companies(conn)
+    if not companies:
+        st.info("Add a company first in Upload / Crawl.")
+        return
+
+    company_map = {f"{c['name']} (#{c['id']})": c["id"] for c in companies}
+    company_selection = st.selectbox("Select company", list(company_map.keys()), key="public_company")
+    company_id = company_map[company_selection]
+    company = db.get_company(conn, company_id)
+
+    tabs = st.tabs(["OpenCorporates", "SEC EDGAR", "GDELT News"])
+
+    with tabs[0]:
+        st.subheader("OpenCorporates")
+        oc_token = st.text_input(
+            "OpenCorporates API token",
+            value=os.getenv("OPENCORPORATES_API_TOKEN", ""),
+            type="password",
+        )
+        oc_query = st.text_input("Company name", value=company["name"] or "")
+        oc_jurisdiction = st.text_input("Jurisdiction code (optional)")
+
+        if st.button("Search OpenCorporates"):
+            if not oc_token:
+                st.error("OPENCORPORATES_API_TOKEN is required")
+            elif not oc_query:
+                st.error("Enter a company name to search")
+            else:
+                try:
+                    results = public_data.opencorporates_search(oc_query, oc_token, oc_jurisdiction or None)
+                    st.session_state["oc_results"] = results
+                except Exception as exc:
+                    st.error(f"OpenCorporates search failed: {exc}")
+
+        results = st.session_state.get("oc_results", [])
+        if results:
+            options = []
+            for r in results:
+                label = f"{r.get('name')} ({r.get('jurisdiction_code')}:{r.get('company_number')})"
+                options.append(label)
+            selected = st.selectbox("Select match", options, key="oc_select")
+            selected_idx = options.index(selected)
+            selected_company = results[selected_idx]
+
+            if st.button("Fetch OpenCorporates details"):
+                try:
+                    details = public_data.opencorporates_fetch_company(
+                        selected_company.get("jurisdiction_code"),
+                        selected_company.get("company_number"),
+                        oc_token,
+                    )
+                    signals = public_data.opencorporates_signals(details)
+                    st.session_state["oc_signals"] = signals
+                    st.session_state["oc_ref"] = details.get("opencorporates_url")
+                except Exception as exc:
+                    st.error(f"OpenCorporates fetch failed: {exc}")
+
+        oc_signals = st.session_state.get("oc_signals")
+        if oc_signals:
+            st.dataframe(pd.DataFrame(list(oc_signals.items()), columns=["signal_key", "value"]))
+            if st.button("Save OpenCorporates signals"):
+                saved = 0
+                for key, value in oc_signals.items():
+                    if value is None:
+                        continue
+                    value_num, value_text, value_bool, value_json = extraction.normalize_value(
+                        value, next((d["value_type"] for d in db.list_signal_definitions(conn) if d["key"] == key), "text")
+                    )
+                    db.add_signal_value(
+                        conn,
+                        company_id,
+                        key,
+                        value_num,
+                        value_text,
+                        value_bool,
+                        value_json,
+                        source_type="opencorporates",
+                        source_ref=st.session_state.get("oc_ref"),
+                        notes="opencorporates",
+                    )
+                    saved += 1
+                st.success(f"Saved {saved} OpenCorporates signals")
+
+    with tabs[1]:
+        st.subheader("SEC EDGAR")
+        st.caption("SEC requires a descriptive User-Agent (e.g., Your Name your@email.com).")
+        sec_user_agent = st.text_input(
+            "SEC User-Agent",
+            value=os.getenv("SEC_USER_AGENT", ""),
+        )
+        sec_input = st.text_input("CIK or ticker", value="")
+
+        if st.button("Fetch SEC signals"):
+            if not sec_user_agent:
+                st.error("SEC_USER_AGENT is required")
+            elif not sec_input:
+                st.error("Enter a CIK or ticker")
+            else:
+                try:
+                    cik = sec_input.strip()
+                    if not cik.isdigit():
+                        cik = public_data.sec_lookup_cik(cik, sec_user_agent)
+                        if not cik:
+                            st.error("Ticker not found in SEC mapping")
+                            cik = None
+                    if cik:
+                        submissions = public_data.sec_fetch_submissions(cik, sec_user_agent)
+                        signals = public_data.sec_signals(submissions)
+                        signals["sec_cik"] = cik
+                        st.session_state["sec_signals"] = signals
+                except Exception as exc:
+                    st.error(f"SEC fetch failed: {exc}")
+
+        sec_signals = st.session_state.get("sec_signals")
+        if sec_signals:
+            st.dataframe(pd.DataFrame(list(sec_signals.items()), columns=["signal_key", "value"]))
+            if st.button("Save SEC signals"):
+                saved = 0
+                for key, value in sec_signals.items():
+                    if value is None:
+                        continue
+                    value_num, value_text, value_bool, value_json = extraction.normalize_value(
+                        value, next((d["value_type"] for d in db.list_signal_definitions(conn) if d["key"] == key), "text")
+                    )
+                    db.add_signal_value(
+                        conn,
+                        company_id,
+                        key,
+                        value_num,
+                        value_text,
+                        value_bool,
+                        value_json,
+                        source_type="sec",
+                        source_ref="data.sec.gov",
+                        notes="sec_edgar",
+                    )
+                    saved += 1
+                st.success(f"Saved {saved} SEC signals")
+
+    with tabs[2]:
+        st.subheader("GDELT News")
+        gd_query = st.text_input("Search query", value=company["name"] or "")
+        gd_days = st.slider("Timespan (days)", min_value=7, max_value=90, value=30)
+
+        if st.button("Fetch GDELT signals"):
+            if not gd_query:
+                st.error("Enter a search query")
+            else:
+                try:
+                    total, timeline, url = public_data.gdelt_timeline_vol_raw(gd_query, days=gd_days)
+                    signals = public_data.gdelt_signals(total, gd_days)
+                    st.session_state["gdelt_signals"] = signals
+                    st.session_state["gdelt_url"] = url
+                    st.session_state["gdelt_timeline"] = timeline
+                except Exception as exc:
+                    st.error(f"GDELT fetch failed: {exc}")
+
+        gdelt_signals = st.session_state.get("gdelt_signals")
+        if gdelt_signals:
+            st.dataframe(pd.DataFrame(list(gdelt_signals.items()), columns=["signal_key", "value"]))
+            if st.button("Save GDELT signals"):
+                saved = 0
+                for key, value in gdelt_signals.items():
+                    if value is None:
+                        continue
+                    value_num, value_text, value_bool, value_json = extraction.normalize_value(
+                        value, next((d["value_type"] for d in db.list_signal_definitions(conn) if d["key"] == key), "text")
+                    )
+                    db.add_signal_value(
+                        conn,
+                        company_id,
+                        key,
+                        value_num,
+                        value_text,
+                        value_bool,
+                        value_json,
+                        source_type="gdelt",
+                        source_ref=st.session_state.get("gdelt_url"),
+                        notes=f"gdelt_timespan_days={gd_days}",
+                    )
+                    saved += 1
+                st.success(f"Saved {saved} GDELT signals")
+
+
+def main():
+    st.set_page_config(page_title="AI Sourcing MVP", layout="wide")
+    db.init_db()
+    conn = db.get_conn()
+    seed_defaults(conn)
+
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio(
+        "Go to",
+        [
+            "Dashboard",
+            "Companies",
+            "Company Detail",
+            "Signals Manager",
+            "Criteria Manager",
+            "Upload / Crawl",
+            "Optimization",
+            "Benchmarking",
+            "Risk Detection",
+            "Public Data",
+        ],
+    )
+
+    if page == "Dashboard":
+        page_dashboard(conn)
+    elif page == "Companies":
+        page_companies(conn)
+    elif page == "Company Detail":
+        page_company_detail(conn)
+    elif page == "Signals Manager":
+        page_signals_manager(conn)
+    elif page == "Criteria Manager":
+        page_criteria_manager(conn)
+    elif page == "Upload / Crawl":
+        page_upload_crawl(conn)
+    elif page == "Optimization":
+        page_optimization(conn)
+    elif page == "Benchmarking":
+        page_benchmarking(conn)
+    elif page == "Risk Detection":
+        page_risk_detection(conn)
+    elif page == "Public Data":
+        page_public_data(conn)
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

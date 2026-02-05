@@ -1,0 +1,173 @@
+{
+  "financial": [
+    {
+      "type": "unrealistic_growth",
+      "signal_keys": ["revenue_growth_rate"],
+      "rule": { "op": "gt", "threshold": 500 },
+      "severity": "high",
+      "weight": 1.0,
+      "description": "YoY revenue growth exceeds 500%"
+    },
+    {
+      "type": "burn_multiple",
+      "signal_keys": ["burn_rate", "revenue"],
+      "calc": "ratio",
+      "rule": { "op": "gt", "threshold": 10 },
+      "severity": "high",
+      "weight": 1.0,
+      "description": "Burn exceeds revenue by >10x"
+    },
+    {
+      "type": "short_runway",
+      "signal_keys": ["runway_months"],
+      "rule": { "op": "lt", "threshold": 3 },
+      "severity": "critical",
+      "weight": 1.0,
+      "description": "Runway under 3 months"
+    },
+    {
+      "type": "large_unexplained_expenses",
+      "signal_keys": ["expense_growth_rate"],
+      "rule": { "op": "gt", "threshold": 100 },
+      "severity": "medium",
+      "weight": 0.7,
+      "description": "Operating expenses growing >100%"
+    },
+    {
+      "type": "sudden_budget_cuts",
+      "signal_keys": ["headcount_change_pct"],
+      "rule": { "op": "lt", "threshold": -20 },
+      "severity": "medium",
+      "weight": 0.6,
+      "description": "Headcount dropped >20%"
+    }
+  ],
+  "market": [
+    {
+      "type": "tam_sam_som_mismatch",
+      "signal_keys": ["tam", "sam", "som"],
+      "calc": "tam_sam_som",
+      "severity": "medium",
+      "weight": 0.8,
+      "description": "TAM/SAM/SOM ordering is inconsistent"
+    },
+    {
+      "type": "declining_market",
+      "signal_keys": ["market_growth_rate"],
+      "rule": { "op": "lt", "threshold": 0 },
+      "severity": "medium",
+      "weight": 0.7,
+      "description": "Market growth rate is negative"
+    },
+    {
+      "type": "saturated_market",
+      "signal_keys": ["competitor_count"],
+      "rule": { "op": "gt", "threshold": 100 },
+      "severity": "medium",
+      "weight": 0.6,
+      "description": "More than 100 competitors"
+    },
+    {
+      "type": "regulatory_headwinds",
+      "signal_keys": ["regulatory_headwinds_flag"],
+      "rule": { "op": "eq", "threshold": 1 },
+      "severity": "high",
+      "weight": 0.9,
+      "description": "Regulatory headwinds present"
+    }
+  ],
+  "team": [
+    {
+      "type": "founder_turnover_recent",
+      "signal_keys": ["founder_turnover_6m"],
+      "rule": { "op": "gt", "threshold": 0 },
+      "severity": "high",
+      "weight": 0.9,
+      "description": "Founder/CEO change in last 6 months"
+    },
+    {
+      "type": "missing_key_roles",
+      "signal_keys": ["has_cto", "has_cpo"],
+      "calc": "any_false",
+      "severity": "medium",
+      "weight": 0.7,
+      "description": "Missing key leadership roles"
+    },
+    {
+      "type": "advisor_red_flags",
+      "signal_keys": ["advisor_failed_startups"],
+      "rule": { "op": "gt", "threshold": 0 },
+      "severity": "medium",
+      "weight": 0.6,
+      "description": "Advisors linked to failed startups"
+    }
+  ],
+  "traction": [
+    {
+      "type": "high_churn",
+      "signal_keys": ["churn_rate"],
+      "rule": { "op": "gt", "threshold": 10 },
+      "severity": "critical",
+      "weight": 1.0,
+      "description": "Monthly churn above 10%"
+    },
+    {
+      "type": "no_repeat_customers",
+      "signal_keys": ["repeat_customer_rate"],
+      "rule": { "op": "lt", "threshold": 10 },
+      "severity": "high",
+      "weight": 0.8,
+      "description": "Repeat customer rate below 10%"
+    },
+    {
+      "type": "vanity_metrics",
+      "signal_keys": ["downloads", "mau"],
+      "calc": "missing_second",
+      "severity": "medium",
+      "weight": 0.6,
+      "description": "Downloads without MAU/DAU"
+    },
+    {
+      "type": "declining_engagement",
+      "signal_keys": ["dau_mau_ratio_change_pct"],
+      "rule": { "op": "lt", "threshold": -20 },
+      "severity": "medium",
+      "weight": 0.6,
+      "description": "DAU/MAU down >20%"
+    }
+  ],
+  "legal": [
+    {
+      "type": "lawsuit_mentions",
+      "signal_keys": ["lawsuit_count"],
+      "rule": { "op": "gt", "threshold": 0 },
+      "severity": "high",
+      "weight": 0.9,
+      "description": "Lawsuits mentioned"
+    },
+    {
+      "type": "regulatory_violations",
+      "signal_keys": ["regulatory_violation_count"],
+      "rule": { "op": "gt", "threshold": 0 },
+      "severity": "high",
+      "weight": 0.9,
+      "description": "Regulatory violations reported"
+    },
+    {
+      "type": "ip_disputes",
+      "signal_keys": ["ip_dispute_count"],
+      "rule": { "op": "gt", "threshold": 0 },
+      "severity": "medium",
+      "weight": 0.7,
+      "description": "IP disputes mentioned"
+    },
+    {
+      "type": "data_breach",
+      "signal_keys": ["security_incident_count"],
+      "rule": { "op": "gt", "threshold": 0 },
+      "severity": "high",
+      "weight": 0.9,
+      "description": "Data breach or security incident"
+    }
+  ]
+}
