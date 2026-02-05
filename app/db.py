@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+from urllib.parse import urlparse
 from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "app.db")
@@ -8,8 +9,10 @@ DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "app.
 
 def get_conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -398,7 +401,39 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crawl_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT NOT NULL,
+            intensity TEXT NOT NULL,
+            allowlist_json TEXT,
+            news_domains_json TEXT,
+            agent_mode INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            entity_type TEXT,
+            entity_id INTEGER,
+            details_json TEXT,
+            created_at TEXT NOT NULL,
+            actor TEXT
+        )
+        """
+    )
+
     conn.commit()
+    _ensure_column(conn, "companies", "canonical_domain", "TEXT")
+    _ensure_column(conn, "companies", "deleted_at", "TEXT")
+    _ensure_column(conn, "companies", "deleted_by", "TEXT")
     _ensure_column(conn, "score_items", "raw_total", "REAL")
     _ensure_column(conn, "score_items", "normalized_total", "REAL")
     _ensure_column(conn, "score_items", "weight_used", "REAL")
@@ -414,9 +449,13 @@ def init_db():
     _ensure_column(conn, "signal_definitions", "automation_type", "TEXT")
     _ensure_column(conn, "signal_definitions", "automation_detail", "TEXT")
     _ensure_column(conn, "signal_definitions", "automation_prompt", "TEXT")
+    _ensure_column(conn, "crawl_settings", "allowlist_json", "TEXT")
+    _ensure_column(conn, "crawl_settings", "news_domains_json", "TEXT")
+    _ensure_column(conn, "crawl_settings", "agent_mode", "INTEGER")
     _ensure_document_tables(conn)
     _ensure_default_risk_rules(conn)
     _ensure_default_criteria_set(conn)
+    _backfill_company_domains(conn)
     conn.close()
 
 
@@ -741,9 +780,12 @@ def add_signal_value(
     return cur.lastrowid
 
 
-def list_companies(conn):
+def list_companies(conn, include_deleted=False):
     cur = conn.cursor()
-    cur.execute("SELECT * FROM companies ORDER BY id DESC")
+    if include_deleted:
+        cur.execute("SELECT * FROM companies ORDER BY id DESC")
+    else:
+        cur.execute("SELECT * FROM companies WHERE deleted_at IS NULL ORDER BY id DESC")
     return cur.fetchall()
 
 
@@ -753,18 +795,112 @@ def get_company(conn, company_id):
     return cur.fetchone()
 
 
+def _normalize_domain(website):
+    if not website:
+        return None
+    raw = website.strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = urlparse(raw)
+    host = parsed.netloc or parsed.path
+    if not host:
+        return None
+    host = host.split("/")[0].split(":")[0].lower().strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    if host.endswith(".com"):
+        host = host[:-4]
+    return host or None
+
+
+def _backfill_company_domains(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT id, website, canonical_domain FROM companies")
+    rows = cur.fetchall()
+    updates = []
+    for r in rows:
+        if r["canonical_domain"]:
+            continue
+        canonical = _normalize_domain(r["website"])
+        if canonical:
+            updates.append((canonical, r["id"]))
+    if updates:
+        cur.executemany("UPDATE companies SET canonical_domain = ? WHERE id = ?", updates)
+        conn.commit()
+
+
+def get_company_by_domain(conn, canonical_domain):
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM companies WHERE canonical_domain = ?", (canonical_domain,))
+    return cur.fetchone()
+
+
 def add_company(conn, name, website=None, description=None, industry=None, location=None, founder_names=None, source="upload"):
     now = _utc_now()
+    canonical_domain = _normalize_domain(website)
+    if canonical_domain:
+        existing = get_company_by_domain(conn, canonical_domain)
+        if existing:
+            return existing["id"], False
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO companies (name, website, description, industry, location, founder_names, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO companies (name, website, canonical_domain, description, industry, location, founder_names, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (name, website, description, industry, location, founder_names, source, now),
+        (name, website, canonical_domain, description, industry, location, founder_names, source, now),
     )
     conn.commit()
-    return cur.lastrowid
+    return cur.lastrowid, True
+
+
+def delete_company(conn, company_id, actor="user"):
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE companies SET deleted_at = ?, deleted_by = ? WHERE id = ?",
+        (_utc_now(), actor, company_id),
+    )
+    conn.commit()
+
+
+def restore_company(conn, company_id, actor="user"):
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE companies SET deleted_at = NULL, deleted_by = NULL WHERE id = ?",
+        (company_id,),
+    )
+    conn.commit()
+
+
+def merge_company_fields(conn, company_id, name=None, website=None, description=None, industry=None, location=None, founder_names=None):
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM companies WHERE id = ?", (company_id,))
+    row = cur.fetchone()
+    if not row:
+        return False
+    updates = {
+        "name": name,
+        "website": website,
+        "description": description,
+        "industry": industry,
+        "location": location,
+        "founder_names": founder_names,
+    }
+    set_parts = []
+    values = []
+    for field, incoming in updates.items():
+        current = row[field]
+        if (current is None or str(current).strip() == "") and incoming:
+            set_parts.append(f"{field} = ?")
+            values.append(incoming)
+    if not set_parts:
+        return False
+    values.append(company_id)
+    cur.execute(f"UPDATE companies SET {', '.join(set_parts)} WHERE id = ?", values)
+    conn.commit()
+    return True
 
 
 def list_latest_signal_values(conn, company_id):
@@ -967,6 +1103,7 @@ def list_latest_score_summary(conn):
             JOIN score_runs sr ON sr.id = si.score_run_id
             WHERE sr.id = (SELECT MAX(id) FROM score_runs)
         ) s ON s.company_id = c.id
+        WHERE c.deleted_at IS NULL
         ORDER BY (s.total_score IS NULL), s.total_score DESC, c.name ASC
         """
     )
@@ -1269,6 +1406,72 @@ def get_risk_report(conn, company_id):
         "risk_level": run_item.get("risk_level"),
         "flags": output_flags,
     }
+
+
+def get_crawl_settings(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM crawl_settings ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    return row
+
+
+def upsert_crawl_settings(conn, mode, intensity, allowlist, news_domains, agent_mode, actor="user"):
+    cur = conn.cursor()
+    now = _utc_now()
+    cur.execute(
+        """
+        INSERT INTO crawl_settings (mode, intensity, allowlist_json, news_domains_json, agent_mode, updated_at, updated_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (mode, intensity, json.dumps(allowlist or []), json.dumps(news_domains or []), 1 if agent_mode else 0, now, actor),
+    )
+    conn.commit()
+
+
+def add_activity(conn, event_type, entity_type=None, entity_id=None, details=None, actor="system"):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO activity_log (event_type, entity_type, entity_id, details_json, created_at, actor)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_type,
+            entity_type,
+            entity_id,
+            json.dumps(details) if details is not None else None,
+            _utc_now(),
+            actor,
+        ),
+    )
+    conn.commit()
+
+
+def list_activity(conn, limit=200):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM activity_log
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return cur.fetchall()
+
+
+def list_activity_for_company(conn, company_id, limit=200):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM activity_log
+        WHERE entity_type = 'company' AND entity_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (company_id, limit),
+    )
+    return cur.fetchall()
 
 
 def _ensure_default_risk_rules(conn):

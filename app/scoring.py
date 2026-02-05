@@ -322,6 +322,142 @@ def run_scoring(conn, criteria_version_id, actor="user"):
     return score_run_id
 
 
+def run_scoring_for_company(conn, criteria_version_id, company_id, actor="user"):
+    cur = conn.cursor()
+    now = _utc_now()
+    cur.execute(
+        """
+        INSERT INTO score_runs (criteria_set_version_id, run_started_at, triggered_by, notes)
+        VALUES (?, ?, ?, ?)
+        """,
+        (criteria_version_id, now, actor, "auto run (single company)"),
+    )
+    score_run_id = cur.lastrowid
+
+    company = db.get_company(conn, company_id)
+    if company is None:
+        return None
+
+    criteria = db.list_criteria(conn, criteria_version_id)
+    effective_weights, our_angle_weights = _compute_effective_weights(criteria)
+
+    calculate_composite_signals(company["id"], conn)
+    total = 0.0
+    used_weight = 0.0
+    our_angle_total = 0.0
+    our_angle_weight = 0.0
+    score_item_id = None
+
+    for criterion in criteria:
+        if not criterion["enabled"]:
+            continue
+        cur.execute(
+            """
+            SELECT * FROM signal_values
+            WHERE company_id = ? AND signal_key = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (company["id"], criterion["signal_key"]),
+        )
+        signal_row = cur.fetchone()
+        raw_score, explanation = evaluate_criterion(criterion, signal_row)
+        if raw_score is None:
+            continue
+
+        theme = criterion.get("theme")
+        is_our_angle = _is_our_angle(theme)
+
+        if is_our_angle:
+            weight = our_angle_weights.get(criterion["id"], 0.0)
+        else:
+            weight = effective_weights.get(criterion["id"], 0.0)
+        confidence = 1.0
+        if signal_row is not None and signal_row["confidence"] is not None:
+            try:
+                confidence = float(signal_row["confidence"])
+            except (TypeError, ValueError):
+                confidence = 1.0
+        confidence = max(0.0, min(1.0, confidence))
+
+        effective_weight = weight * confidence
+        contribution = float(raw_score) * effective_weight
+        if is_our_angle:
+            our_angle_total += contribution
+            our_angle_weight += effective_weight
+        else:
+            total += contribution
+            used_weight += effective_weight
+
+        explanation = f"{explanation} | confidence {confidence:.2f}"
+        if theme:
+            explanation = f"{explanation} | theme {theme}"
+        if is_our_angle:
+            explanation = f"{explanation} | our_angle"
+
+        if score_item_id is None:
+            cur.execute(
+                """
+                INSERT INTO score_items (score_run_id, company_id, total_score, raw_total, normalized_total, weight_used, our_angle_score, scored_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (score_run_id, company["id"], 0.0, 0.0, 0.0, 0.0, None, now),
+            )
+            score_item_id = cur.lastrowid
+
+        cur.execute(
+            """
+            INSERT INTO score_components (
+                score_item_id, criterion_id, signal_value_id, raw_value, raw_score, weight,
+                contribution, passed, explanation, evaluated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                score_item_id,
+                criterion["id"],
+                signal_row["id"] if signal_row else None,
+                json.dumps(_parse_signal_value(signal_row)) if signal_row else None,
+                float(raw_score),
+                float(weight),
+                contribution,
+                1 if raw_score >= 1.0 else 0,
+                explanation,
+                now,
+            ),
+        )
+
+    raw_total = total
+    normalized_total = raw_total / used_weight if used_weight > 0 else 0.0
+    our_angle_score = our_angle_total / our_angle_weight if our_angle_weight > 0 else None
+
+    if score_item_id is None:
+        cur.execute(
+            """
+            INSERT INTO score_items (score_run_id, company_id, total_score, raw_total, normalized_total, weight_used, our_angle_score, scored_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (score_run_id, company["id"], normalized_total, raw_total, normalized_total, used_weight, our_angle_score, now),
+        )
+        score_item_id = cur.lastrowid
+
+    cur.execute(
+        """
+        UPDATE score_items
+        SET total_score = ?, raw_total = ?, normalized_total = ?, weight_used = ?, our_angle_score = ?
+        WHERE id = ?
+        """,
+        (normalized_total, raw_total, normalized_total, used_weight, our_angle_score, score_item_id),
+    )
+
+    cur.execute("UPDATE score_runs SET run_completed_at = ? WHERE id = ?", (now, score_run_id))
+    conn.commit()
+    try:
+        db.add_activity(conn, "score_company", "company", company_id, {"criteria_version_id": criteria_version_id}, actor=actor)
+    except Exception:
+        pass
+    return score_run_id
+
+
 def evaluate_criterion_with_confidence(criterion, signal_row):
     value = _parse_signal_value(signal_row)
     if value is None:

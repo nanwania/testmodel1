@@ -749,6 +749,10 @@ class RiskDetectionEngine:
             db.add_risk_flags(self.conn, run_item_id, flags)
 
         db.complete_risk_run(self.conn, run_id)
+        try:
+            db.add_activity(self.conn, "risk_scan", "company", None, {"run_id": run_id, "company_count": len(companies)}, actor=actor)
+        except Exception:
+            pass
         return run_id, None
 
     def _quick_rules(self, company_id: int) -> List[dict]:

@@ -184,6 +184,7 @@ def extract_signals_with_openai(
     signal_defs,
     model: str = DEFAULT_MODEL,
 ) -> Dict[str, object]:
+    signal_defs = [dict(d) for d in signal_defs]
     if OpenAI is None:
         raise RuntimeError("openai package is not installed")
 
