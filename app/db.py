@@ -47,6 +47,9 @@ def init_db():
             value_type TEXT NOT NULL,
             unit TEXT,
             allowed_range_json TEXT,
+            automation_type TEXT,
+            automation_detail TEXT,
+            automation_prompt TEXT,
             disabled INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             created_by TEXT
@@ -118,6 +121,11 @@ def init_db():
             scoring_method TEXT NOT NULL,
             params_json TEXT,
             missing_policy TEXT NOT NULL,
+            theme TEXT,
+            subtheme TEXT,
+            score_min REAL,
+            score_max REAL,
+            display_order INTEGER,
             created_at TEXT NOT NULL,
             created_by TEXT,
             FOREIGN KEY(criteria_set_version_id) REFERENCES criteria_set_versions(id)
@@ -149,6 +157,7 @@ def init_db():
             raw_total REAL,
             normalized_total REAL,
             weight_used REAL,
+            our_angle_score REAL,
             scored_at TEXT NOT NULL,
             FOREIGN KEY(score_run_id) REFERENCES score_runs(id),
             FOREIGN KEY(company_id) REFERENCES companies(id)
@@ -393,9 +402,18 @@ def init_db():
     _ensure_column(conn, "score_items", "raw_total", "REAL")
     _ensure_column(conn, "score_items", "normalized_total", "REAL")
     _ensure_column(conn, "score_items", "weight_used", "REAL")
+    _ensure_column(conn, "score_items", "our_angle_score", "REAL")
     _ensure_column(conn, "signal_values", "confidence", "REAL")
     _ensure_column(conn, "signal_values", "evidence_text", "TEXT")
     _ensure_column(conn, "signal_values", "evidence_page", "INTEGER")
+    _ensure_column(conn, "criteria", "theme", "TEXT")
+    _ensure_column(conn, "criteria", "subtheme", "TEXT")
+    _ensure_column(conn, "criteria", "score_min", "REAL")
+    _ensure_column(conn, "criteria", "score_max", "REAL")
+    _ensure_column(conn, "criteria", "display_order", "INTEGER")
+    _ensure_column(conn, "signal_definitions", "automation_type", "TEXT")
+    _ensure_column(conn, "signal_definitions", "automation_detail", "TEXT")
+    _ensure_column(conn, "signal_definitions", "automation_prompt", "TEXT")
     _ensure_document_tables(conn)
     _ensure_default_risk_rules(conn)
     _ensure_default_criteria_set(conn)
@@ -562,8 +580,10 @@ def replace_criteria_version(conn, version_id, criteria_rows, actor="user"):
             """
             INSERT INTO criteria (
                 criteria_set_version_id, name, description, signal_key, weight,
-                enabled, scoring_method, params_json, missing_policy, created_at, created_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                enabled, scoring_method, params_json, missing_policy,
+                theme, subtheme, score_min, score_max, display_order,
+                created_at, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_version_id,
@@ -575,6 +595,11 @@ def replace_criteria_version(conn, version_id, criteria_rows, actor="user"):
                 c.get("scoring_method"),
                 c.get("params_json"),
                 c.get("missing_policy"),
+                c.get("theme"),
+                c.get("subtheme"),
+                c.get("score_min"),
+                c.get("score_max"),
+                c.get("display_order"),
                 now,
                 actor,
             ),
@@ -609,14 +634,18 @@ def upsert_signal_definitions(conn, defs, actor="user"):
     cur = conn.cursor()
     now = _utc_now()
     for d in defs:
-        cur.execute("SELECT id, name, description, value_type, unit, allowed_range_json, disabled FROM signal_definitions WHERE key = ?", (d["key"],))
+        cur.execute(
+            "SELECT id, name, description, value_type, unit, allowed_range_json, disabled, automation_type, automation_detail, automation_prompt FROM signal_definitions WHERE key = ?",
+            (d["key"],),
+        )
         existing = cur.fetchone()
         if existing:
             old = dict(existing)
             cur.execute(
                 """
                 UPDATE signal_definitions
-                SET name = ?, description = ?, value_type = ?, unit = ?, allowed_range_json = ?, disabled = ?
+                SET name = ?, description = ?, value_type = ?, unit = ?, allowed_range_json = ?, disabled = ?,
+                    automation_type = ?, automation_detail = ?, automation_prompt = ?
                 WHERE key = ?
                 """,
                 (
@@ -626,6 +655,9 @@ def upsert_signal_definitions(conn, defs, actor="user"):
                     d.get("unit"),
                     d.get("allowed_range_json"),
                     1 if d.get("disabled") else 0,
+                    d.get("automation_type"),
+                    d.get("automation_detail"),
+                    d.get("automation_prompt"),
                     d.get("key"),
                 ),
             )
@@ -633,8 +665,9 @@ def upsert_signal_definitions(conn, defs, actor="user"):
         else:
             cur.execute(
                 """
-                INSERT INTO signal_definitions (key, name, description, value_type, unit, allowed_range_json, disabled, created_at, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO signal_definitions (key, name, description, value_type, unit, allowed_range_json, disabled,
+                                                automation_type, automation_detail, automation_prompt, created_at, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d.get("key"),
@@ -644,6 +677,9 @@ def upsert_signal_definitions(conn, defs, actor="user"):
                     d.get("unit"),
                     d.get("allowed_range_json"),
                     1 if d.get("disabled") else 0,
+                    d.get("automation_type"),
+                    d.get("automation_detail"),
+                    d.get("automation_prompt"),
                     now,
                     actor,
                 ),
@@ -751,6 +787,77 @@ def list_latest_signal_values(conn, company_id):
     return cur.fetchall()
 
 
+def _parse_signal_row(row):
+    if row is None:
+        return None
+    if row.get("value_num") is not None:
+        return float(row["value_num"])
+    if row.get("value_bool") is not None:
+        return bool(row["value_bool"])
+    if row.get("value_text") is not None:
+        return row["value_text"]
+    if row.get("value_json"):
+        try:
+            return json.loads(row["value_json"])
+        except json.JSONDecodeError:
+            return row["value_json"]
+    return None
+
+
+def get_all_signals(conn, company_id):
+    rows = list_latest_signal_values(conn, company_id)
+    return {row["signal_key"]: _parse_signal_row(dict(row)) for row in rows}
+
+
+def upsert_signal_value(conn, company_id, signal_key, value, source_type="derived", source_ref=None, actor="system", confidence=0.8, notes=None):
+    cur = conn.cursor()
+    cur.execute("SELECT value_type FROM signal_definitions WHERE key = ?", (signal_key,))
+    row = cur.fetchone()
+    value_type = row["value_type"] if row else "number"
+
+    value_num = None
+    value_text = None
+    value_bool = None
+    value_json = None
+
+    if value_type == "number":
+        try:
+            value_num = float(value)
+        except (TypeError, ValueError):
+            value_num = None
+    elif value_type == "bool":
+        if isinstance(value, bool):
+            value_bool = 1 if value else 0
+        elif isinstance(value, (int, float)):
+            value_bool = 1 if value else 0
+        elif isinstance(value, str):
+            value_bool = 1 if value.strip().lower() in ("true", "yes", "1") else 0
+    elif value_type == "json":
+        try:
+            value_json = json.dumps(value)
+        except TypeError:
+            value_json = None
+    else:
+        value_text = str(value) if value is not None else None
+
+    add_signal_value(
+        conn,
+        company_id,
+        signal_key,
+        value_num,
+        value_text,
+        value_bool,
+        value_json,
+        source_type,
+        source_ref,
+        actor=actor,
+        notes=notes,
+        confidence=confidence,
+        evidence_text=None,
+        evidence_page=None,
+    )
+
+
 def list_signal_history(conn, company_id, signal_key):
     cur = conn.cursor()
     cur.execute(
@@ -811,6 +918,11 @@ def list_score_components(conn, company_id):
     cur.execute(
         """
         SELECT sc.*, c.name AS criterion_name,
+               c.weight AS criterion_weight_raw,
+               c.theme AS criterion_theme,
+               c.subtheme AS criterion_subtheme,
+               c.scoring_method AS criterion_method,
+               c.missing_policy AS criterion_missing_policy,
                sv.confidence AS signal_confidence,
                sv.evidence_text AS signal_evidence,
                sv.evidence_page AS signal_evidence_page
@@ -1133,7 +1245,8 @@ def get_risk_report(conn, company_id):
     run_item = get_latest_risk_run_item(conn, company_id)
     if not run_item:
         return None
-    flags = list_latest_risk_flags(conn, company_id)
+    run_item = dict(run_item)
+    flags = [dict(f) for f in list_latest_risk_flags(conn, company_id)]
     output_flags = []
     for f in flags:
         output_flags.append(

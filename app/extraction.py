@@ -195,6 +195,16 @@ def extract_signals_with_openai(
 
     allowed = [d["key"] for d in signal_defs if not d["disabled"]]
     types = {d["key"]: d["value_type"] for d in signal_defs}
+    catalog_lines = []
+    for d in signal_defs:
+        if d["disabled"]:
+            continue
+        name = d.get("name") or ""
+        desc = d.get("description") or ""
+        prompt = d.get("automation_prompt") or ""
+        extra = f" | {prompt}" if prompt else ""
+        catalog_lines.append(f"{d['key']}: {name} - {desc}{extra} ({d['value_type']})")
+    catalog = "\n".join(catalog_lines)
 
     system_msg = (
         "You extract structured startup signals from raw website text. "
@@ -211,7 +221,7 @@ def extract_signals_with_openai(
         "Extract the following signals from the text and return JSON only. "
         f"Keys: {allowed}. "
         f"Value types: {types}. "
-        f"Text: {short_text}"
+        f"Signals:\n{catalog}\n\nText: {short_text}"
     )
 
     response = client.chat.completions.create(

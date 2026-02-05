@@ -13,8 +13,10 @@ from app import extraction
 from app import rag
 from app import public_data
 from app import benchmark
-from app import risk
 from app import risk_detector
+from app import criteria_import
+from app import criteria_ai
+from app import simple_benchmark
 
 
 def _utc_now():
@@ -529,6 +531,34 @@ def page_company_detail(conn):
     else:
         st.info("No signals yet for this company.")
 
+    st.subheader("AI-Assisted Criteria Scoring")
+    st.caption("Scores AI-automatable criteria (0–5) using website + founder materials and saves them as signals.")
+    ai_include_website = st.checkbox("Include website", value=True, key="ai_score_website")
+    ai_url = st.text_input("Website URL", value=company["website"] or "", key="ai_score_url")
+    ai_max_pages = st.slider("Max pages to crawl", min_value=1, max_value=10, value=5, key="ai_score_pages")
+    ai_same_domain = st.checkbox("Only crawl same domain", value=True, key="ai_score_same_domain")
+    ai_include_founder = st.checkbox("Include founder materials", value=True, key="ai_score_founder")
+    ai_top_k = st.slider("Founder materials top chunks", min_value=3, max_value=15, value=8, key="ai_score_topk")
+    ai_model = st.text_input("OpenAI model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), key="ai_score_model")
+    ai_budget = st.number_input("AI budget per company (USD)", min_value=0.0, max_value=5.0, value=0.2, step=0.05, key="ai_score_budget")
+    if st.button("Run AI criteria scoring", key="ai_score_run"):
+        saved, err = criteria_ai.run_ai_scoring(
+            conn,
+            company_id,
+            model=ai_model,
+            ai_budget_usd=ai_budget,
+            include_website=ai_include_website,
+            include_founder_materials=ai_include_founder,
+            website_url=ai_url or None,
+            max_pages=ai_max_pages,
+            same_domain=ai_same_domain,
+            top_k=ai_top_k,
+        )
+        if err:
+            st.error(err)
+        else:
+            st.success(f"Saved {saved} AI-scored signals.")
+
     st.subheader("Score Breakdown")
     score_item = db.list_latest_score_item(conn, company_id)
     if score_item:
@@ -536,14 +566,29 @@ def page_company_detail(conn):
         col1.metric("Normalized Score", round(score_item["normalized_total"] or score_item["total_score"] or 0.0, 4))
         col2.metric("Raw Score", round(score_item["raw_total"] or 0.0, 4))
         col3.metric("Weight Used", round(score_item["weight_used"] or 0.0, 4))
+        if score_item["our_angle_score"] is not None:
+            st.metric("Our Angle Score", round(score_item["our_angle_score"], 4))
+
+        with st.expander("Scoring transparency"):
+            st.write(
+                "Main score = sum(raw_score × effective_weight × confidence) / sum(effective_weight × confidence). "
+                "Effective weights are normalized per theme (excluding 'Our Angle'). "
+                "Our Angle score is computed separately from its own theme weights."
+            )
         components = db.list_score_components(conn, company_id)
         if components:
+            comp_df = pd.DataFrame(components).rename(
+                columns={"weight": "effective_weight", "criterion_weight_raw": "raw_weight"}
+            )
             st.dataframe(
-                pd.DataFrame(components)[
+                comp_df[
                     [
                         "criterion_name",
+                        "criterion_theme",
+                        "criterion_subtheme",
+                        "raw_weight",
                         "raw_score",
-                        "weight",
+                        "effective_weight",
                         "contribution",
                         "signal_confidence",
                         "signal_evidence_page",
@@ -574,31 +619,55 @@ def page_company_detail(conn):
     else:
         st.info("No benchmark results yet. Run Benchmarking.")
 
+    st.subheader("Simple Benchmarks (Quick Win)")
+    industry_key = (company["industry"] or "").lower().replace(" ", "_")
+    if industry_key in simple_benchmark.SECTOR_BENCHMARKS:
+        signals_map = db.get_all_signals(conn, company_id)
+        benchmarks = simple_benchmark.SECTOR_BENCHMARKS[industry_key]
+        rows = []
+        for metric_key, metric_bench in benchmarks.items():
+            value = signals_map.get(metric_key)
+            if value is None:
+                continue
+            rows.append(
+                {
+                    "metric": metric_key,
+                    "value": value,
+                    "percentile": simple_benchmark.percentile_rank(value, metric_bench),
+                }
+            )
+        if rows:
+            st.dataframe(pd.DataFrame(rows))
+        else:
+            st.info("No matching metrics for quick benchmarks.")
+    else:
+        st.info("No quick benchmarks configured for this industry.")
+
     st.subheader("Intelligent Risk (Latest Run)")
     risk_item = db.get_latest_risk_run_item(conn, company_id)
     if risk_item:
-        st.metric("Risk Score", f\"{risk_item['risk_score']:.2f}\", risk_item[\"risk_level\"].title())
+        st.metric("Risk Score", f"{risk_item['risk_score']:.2f}", risk_item["risk_level"].title())
         risk_flags = db.list_latest_risk_flags(conn, company_id)
         if risk_flags:
             st.dataframe(
                 pd.DataFrame(risk_flags)[
                     [
-                        \"category\",
-                        \"risk_type\",
-                        \"severity\",
-                        \"confidence\",
-                        \"description\",
-                        \"evidence_text\",
-                        \"source_ref\",
-                        \"evidence_page\",
-                        \"method\",
+                        "category",
+                        "risk_type",
+                        "severity",
+                        "confidence",
+                        "description",
+                        "evidence_text",
+                        "source_ref",
+                        "evidence_page",
+                        "method",
                     ]
                 ]
             )
         else:
-            st.info(\"No risk flags in latest intelligent scan.\")
+            st.info("No risk flags in latest intelligent scan.")
     else:
-        st.info(\"No intelligent risk scans yet. Run Risk Detection.\")
+        st.info("No intelligent risk scans yet. Run Risk Detection.")
 
 
 def page_signals_manager(conn):
@@ -613,7 +682,20 @@ def page_signals_manager(conn):
         else:
             df = pd.DataFrame(columns=["key", "name", "description", "value_type", "unit", "allowed_range_json", "disabled"])
         editor = st.data_editor(
-            df[["key", "name", "description", "value_type", "unit", "allowed_range_json", "disabled"]],
+            df[
+                [
+                    "key",
+                    "name",
+                    "description",
+                    "value_type",
+                    "unit",
+                    "allowed_range_json",
+                    "disabled",
+                    "automation_type",
+                    "automation_detail",
+                    "automation_prompt",
+                ]
+            ],
             num_rows="dynamic",
             use_container_width=True,
         )
@@ -631,6 +713,9 @@ def page_signals_manager(conn):
                     "unit": r.get("unit"),
                     "allowed_range_json": r.get("allowed_range_json"),
                     "disabled": bool(r.get("disabled")),
+                    "automation_type": r.get("automation_type"),
+                    "automation_detail": r.get("automation_detail"),
+                    "automation_prompt": r.get("automation_prompt"),
                 })
             db.upsert_signal_definitions(conn, cleaned)
             st.success("Definitions saved")
@@ -766,6 +851,63 @@ def _validate_params_json(params_json):
 def page_criteria_manager(conn):
     st.header("Criteria Manager")
 
+    st.subheader("Import from Excel")
+    default_excel = os.path.join("data", "Quantitative Investment Checklist - ANON.xlsx")
+    excel_path = st.text_input("Excel file path", value=default_excel)
+    if st.button("Preview Excel criteria"):
+        try:
+            parsed = criteria_import.parse_excel_criteria(excel_path)
+            st.session_state["excel_criteria_preview"] = parsed
+            st.success(f"Parsed {len(parsed)} criteria from Excel")
+        except Exception as exc:
+            st.error(f"Failed to parse Excel: {exc}")
+
+    preview = st.session_state.get("excel_criteria_preview")
+    if preview:
+        st.dataframe(pd.DataFrame(preview)[["theme", "subtheme", "name", "weight", "signal_key", "automation_type"]])
+        if st.button("Import as new criteria version"):
+            defs = []
+            for row in preview:
+                defs.append(
+                    {
+                        "key": row["signal_key"],
+                        "name": row["name"],
+                        "description": f"{row['theme']} / {row['subtheme']}".strip(" /"),
+                        "value_type": "number",
+                        "unit": "score",
+                        "allowed_range_json": json.dumps({"min": 0, "max": 5}),
+                        "disabled": False,
+                        "automation_type": row.get("automation_type"),
+                        "automation_detail": "llm" if row.get("automation_type") == "ai" else "manual",
+                        "automation_prompt": None,
+                    }
+                )
+            db.upsert_signal_definitions(conn, defs, actor="system")
+
+            criteria_rows = []
+            for row in preview:
+                criteria_rows.append(
+                    {
+                        "name": row["name"],
+                        "description": row.get("description") or row.get("subtheme"),
+                        "signal_key": row["signal_key"],
+                        "weight": float(row["weight"] or 0),
+                        "enabled": True,
+                        "scoring_method": "linear",
+                        "params_json": json.dumps({"min": row.get("score_min", 0), "max": row.get("score_max", 5), "clamp": True}),
+                        "missing_policy": "exclude",
+                        "theme": row.get("theme"),
+                        "subtheme": row.get("subtheme"),
+                        "score_min": row.get("score_min", 0),
+                        "score_max": row.get("score_max", 5),
+                        "display_order": row.get("display_order"),
+                    }
+                )
+
+            version_id = db.get_active_criteria_version_id(conn)
+            new_version_id = db.replace_criteria_version(conn, version_id, criteria_rows, actor="system")
+            st.success(f"Imported criteria into new version {new_version_id}")
+
     version_id = db.get_active_criteria_version_id(conn)
     versions = db.list_criteria_versions(conn)
     current_version = next((v for v in versions if v["id"] == version_id), None)
@@ -776,19 +918,42 @@ def page_criteria_manager(conn):
     if criteria:
         df = pd.DataFrame(criteria)
     else:
-        df = pd.DataFrame(columns=[
-            "name",
-            "description",
-            "signal_key",
-            "weight",
-            "enabled",
-            "scoring_method",
-            "params_json",
-            "missing_policy",
-        ])
+        df = pd.DataFrame(
+            columns=[
+                "name",
+                "description",
+                "signal_key",
+                "weight",
+                "enabled",
+                "scoring_method",
+                "params_json",
+                "missing_policy",
+                "theme",
+                "subtheme",
+                "score_min",
+                "score_max",
+                "display_order",
+            ]
+        )
 
     editor = st.data_editor(
-        df[["name", "description", "signal_key", "weight", "enabled", "scoring_method", "params_json", "missing_policy"]],
+        df[
+            [
+                "name",
+                "description",
+                "signal_key",
+                "weight",
+                "enabled",
+                "scoring_method",
+                "params_json",
+                "missing_policy",
+                "theme",
+                "subtheme",
+                "score_min",
+                "score_max",
+                "display_order",
+            ]
+        ],
         num_rows="dynamic",
         use_container_width=True,
     )
@@ -812,6 +977,11 @@ def page_criteria_manager(conn):
                 "scoring_method": r.get("scoring_method") or "binary",
                 "params_json": r.get("params_json") or "{}",
                 "missing_policy": r.get("missing_policy") or "zero",
+                "theme": r.get("theme"),
+                "subtheme": r.get("subtheme"),
+                "score_min": r.get("score_min"),
+                "score_max": r.get("score_max"),
+                "display_order": r.get("display_order"),
             })
         new_version_id = db.replace_criteria_version(conn, version_id, cleaned)
         st.success(f"Saved new version (id {new_version_id})")
@@ -1313,22 +1483,22 @@ def page_risk_detection(conn):
     company_id = company_map[selection]
     run_item = db.get_latest_risk_run_item(conn, company_id)
     if run_item:
-        st.metric("Risk Score", f\"{run_item['risk_score']:.2f}\", run_item[\"risk_level\"].title())
+        st.metric("Risk Score", f"{run_item['risk_score']:.2f}", run_item["risk_level"].title())
 
     flags = db.list_latest_risk_flags(conn, company_id)
     if flags:
         st.dataframe(
             pd.DataFrame(flags)[
                 [
-                    \"category\",
-                    \"risk_type\",
-                    \"severity\",
-                    \"confidence\",
-                    \"description\",
-                    \"evidence_text\",
-                    \"source_ref\",
-                    \"evidence_page\",
-                    \"method\",
+                    "category",
+                    "risk_type",
+                    "severity",
+                    "confidence",
+                    "description",
+                    "evidence_text",
+                    "source_ref",
+                    "evidence_page",
+                    "method",
                 ]
             ]
         )
@@ -1340,7 +1510,9 @@ def page_risk_detection(conn):
         st.download_button(
             "Export Risk Report (JSON)",
             data=json.dumps(report, indent=2),
-            file_name=f\"risk_report_company_{company_id}.json\",\n            mime=\"application/json\",\n        )
+            file_name=f"risk_report_company_{company_id}.json",
+            mime="application/json",
+        )
 
 
 def page_public_data(conn):

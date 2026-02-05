@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -6,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 from app import db
 from app import rag
+from app import risk_rules
 
 try:
     from openai import OpenAI
@@ -107,13 +109,17 @@ class RuleBasedDetector:
                 hit, payload = self._evaluate_rule(rule, signal_map)
                 if not hit:
                     continue
+                note = payload.pop("note", None)
+                description = rule.get("description") or ""
+                if note:
+                    description = f"{description} ({note})" if description else note
                 payload.update(
                     {
                         "category": category,
                         "risk_type": rule.get("type"),
                         "severity": rule.get("severity", "medium"),
                         "weight": rule.get("weight", 0.6),
-                        "description": rule.get("description"),
+                        "description": description,
                         "method": "rule",
                     }
                 )
@@ -237,7 +243,7 @@ class StatisticalAnomalyDetector:
         if not self.stats:
             return flags
 
-        sector = (company.get("industry") or "").lower()
+        sector = (company["industry"] or "").lower()
         stage = None
         stage_row = signal_map.get("funding_stage") or signal_map.get("stage")
         if stage_row:
@@ -475,7 +481,8 @@ class PatternDetector:
             text = (ch.get("chunk_text") or "").strip().lower()
             if len(text) < 200:
                 continue
-            hashes.add(hash(text))
+            digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+            hashes.add(digest)
 
         shared = 0
         for h in hashes:
@@ -518,8 +525,8 @@ class PatternDetector:
             normalized = text.strip().lower()
             if len(normalized) < 200:
                 continue
-            h = hash(normalized)
-            index.setdefault(h, set()).add(company_id)
+            digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+            index.setdefault(digest, set()).add(company_id)
         return index
 
 
@@ -719,6 +726,7 @@ class RiskDetectionEngine:
 
             flags = []
             flags.extend(self.rule_detector.detect(signal_map))
+            flags.extend(self._quick_rules(company["id"]))
             flags.extend(self.stat_detector.detect(company, signal_map))
             flags.extend(self.pattern_detector.detect(company["id"], signal_map))
             flags.extend(self.cross_validator.detect(company["id"]))
@@ -742,3 +750,24 @@ class RiskDetectionEngine:
 
         db.complete_risk_run(self.conn, run_id)
         return run_id, None
+
+    def _quick_rules(self, company_id: int) -> List[dict]:
+        flags = []
+        quick_flags = risk_rules.detect_risks(company_id, self.conn)
+        for f in quick_flags:
+            flags.append(
+                {
+                    "category": f.get("category") or "financial",
+                    "risk_type": f.get("type") or "quick_rule",
+                    "severity": f.get("severity") or "medium",
+                    "confidence": 0.7,
+                    "description": f.get("message"),
+                    "evidence_text": None,
+                    "source_type": "signal",
+                    "source_ref": "quick_rules",
+                    "evidence_page": None,
+                    "method": "quick_rule",
+                    "weight": 0.6,
+                }
+            )
+        return flags
