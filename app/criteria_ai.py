@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Dict, List, Optional, Tuple
 
 from app import db
@@ -44,6 +45,28 @@ def _build_query_from_defs(defs: List[dict]) -> str:
         parts.append(f"{name} {desc}".strip())
     base = " ".join(parts)
     return f"{base} startup traction team market finance risks".strip()
+
+
+def _agent_profile_from_def(signal_def: dict) -> dict:
+    profile = {}
+    detail = signal_def.get("automation_detail")
+    if isinstance(detail, dict):
+        profile.update(detail)
+    elif isinstance(detail, str) and detail.strip():
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict):
+                profile.update(parsed)
+            else:
+                profile["backstory"] = detail
+        except json.JSONDecodeError:
+            profile["backstory"] = detail
+    if signal_def.get("automation_prompt"):
+        profile["prompt"] = signal_def["automation_prompt"]
+    tools = profile.get("tools")
+    if tools and isinstance(tools, str):
+        profile["tools"] = [t.strip() for t in tools.split(",") if t.strip()]
+    return profile
 
 
 def run_ai_scoring(
@@ -101,6 +124,7 @@ def run_ai_scoring(
             name = d.get("name") or key
             desc = d.get("description") or ""
             query = f"{company['name']} {name} {desc}".strip()
+            agent_profile = _agent_profile_from_def(d)
 
             # Step 1: Try founder materials first. Only run web agents if not found.
             if founder_chunks:
@@ -112,7 +136,13 @@ def run_ai_scoring(
                         return saved, f"Estimated AI cost ${total_est_cost + est_cost:.4f} exceeds budget ${ai_budget_usd:.2f}"
                     total_est_cost += est_cost
                     try:
-                        signals = extraction.extract_signals_with_openai(founder_context, [d], model=model)
+                        signals = extraction.extract_single_signal_with_openai(
+                            founder_context,
+                            d,
+                            model=model,
+                            company_name=company["name"],
+                            agent_profile=agent_profile,
+                        )
                     except Exception:
                         signals = {}
                     payload = signals.get(key)
@@ -150,6 +180,9 @@ def run_ai_scoring(
                                         "source_ref": "founder_material",
                                         "evidence": evidence,
                                         "confidence": confidence,
+                                        "agent_role": agent_profile.get("role"),
+                                        "agent_prompt": agent_profile.get("prompt"),
+                                        "agent_tools": agent_profile.get("tools"),
                                     },
                                     actor="agent",
                                 )
@@ -166,7 +199,14 @@ def run_ai_scoring(
                         "agent_signal",
                         "company",
                         company_id,
-                        {"signal_key": key, "status": "failed", "reason": "founder_only_no_value"},
+                        {
+                            "signal_key": key,
+                            "status": "failed",
+                            "reason": "founder_only_no_value",
+                            "agent_role": agent_profile.get("role"),
+                            "agent_prompt": agent_profile.get("prompt"),
+                            "agent_tools": agent_profile.get("tools"),
+                        },
                         actor="agent",
                     )
                 except Exception:
@@ -188,7 +228,14 @@ def run_ai_scoring(
                         "agent_signal",
                         "company",
                         company_id,
-                        {"signal_key": key, "status": "failed", "reason": "no_sources_found"},
+                        {
+                            "signal_key": key,
+                            "status": "failed",
+                            "reason": "no_sources_found",
+                            "agent_role": agent_profile.get("role"),
+                            "agent_prompt": agent_profile.get("prompt"),
+                            "agent_tools": agent_profile.get("tools"),
+                        },
                         actor="agent",
                     )
                 except Exception:
@@ -200,7 +247,13 @@ def run_ai_scoring(
                 return saved, f"Estimated AI cost ${total_est_cost + est_cost:.4f} exceeds budget ${ai_budget_usd:.2f}"
             total_est_cost += est_cost
             try:
-                signals = extraction.extract_signals_with_openai(context, [d], model=model)
+                signals = extraction.extract_single_signal_with_openai(
+                    context,
+                    d,
+                    model=model,
+                    company_name=company["name"],
+                    agent_profile=agent_profile,
+                )
             except Exception:
                 continue
             payload = signals.get(key)
@@ -211,7 +264,14 @@ def run_ai_scoring(
                         "agent_signal",
                         "company",
                         company_id,
-                        {"signal_key": key, "status": "failed", "reason": "no_value_extracted"},
+                        {
+                            "signal_key": key,
+                            "status": "failed",
+                            "reason": "no_value_extracted",
+                            "agent_role": agent_profile.get("role"),
+                            "agent_prompt": agent_profile.get("prompt"),
+                            "agent_tools": agent_profile.get("tools"),
+                        },
                         actor="agent",
                     )
                 except Exception:
@@ -228,7 +288,14 @@ def run_ai_scoring(
                         "agent_signal",
                         "company",
                         company_id,
-                        {"signal_key": key, "status": "failed", "reason": "empty_value"},
+                        {
+                            "signal_key": key,
+                            "status": "failed",
+                            "reason": "empty_value",
+                            "agent_role": agent_profile.get("role"),
+                            "agent_prompt": agent_profile.get("prompt"),
+                            "agent_tools": agent_profile.get("tools"),
+                        },
                         actor="agent",
                     )
                 except Exception:
@@ -262,6 +329,9 @@ def run_ai_scoring(
                         "source_ref": urls[0] if urls else "web_search",
                         "evidence": evidence,
                         "confidence": confidence,
+                        "agent_role": agent_profile.get("role"),
+                        "agent_prompt": agent_profile.get("prompt"),
+                        "agent_tools": agent_profile.get("tools"),
                     },
                     actor="agent",
                 )

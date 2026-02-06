@@ -49,6 +49,13 @@ def _merge_preview(existing, incoming):
     return to_fill
 
 
+def _shorten(text, max_len=120):
+    if not text:
+        return ""
+    text = str(text)
+    return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+
 def _render_run_tooltips():
     st.sidebar.subheader("Run Steps")
     st.sidebar.caption("Hover each item to see a plain-English explanation.")
@@ -599,6 +606,7 @@ def page_simple(conn):
         founders = st.text_input("Founder names", key="simple_founders")
         description = st.text_area("Short description", key="simple_description")
 
+    use_ocr = st.checkbox("Use OCR for scanned PDFs (requires GCP creds)", value=False, key="simple_use_ocr")
     files = st.file_uploader(
         "Upload founder deck/materials (PDF, PPTX, DOCX, TXT, EML)",
         type=["pdf", "pptx", "docx", "txt", "eml"],
@@ -671,6 +679,7 @@ def page_simple(conn):
                             source_type="founder_material",
                             is_global=False,
                             company_id=company_id,
+                            use_ocr=use_ocr,
                         )
                         processed += 1
                     except Exception as exc:
@@ -907,6 +916,9 @@ def page_company_detail(conn):
                     "Source": (details or {}).get("source") or (details or {}).get("source_ref"),
                     "Found in Founder Materials": (details or {}).get("source") == "founder_material",
                     "Evidence": (details or {}).get("evidence"),
+                    "Agent Role": (details or {}).get("agent_role"),
+                    "Agent Prompt": _shorten((details or {}).get("agent_prompt")),
+                    "Agent Tools": _shorten(", ".join((details or {}).get("agent_tools") or [])),
                     "When": entry.get("created_at"),
                 }
             )
@@ -1110,10 +1122,11 @@ def page_company_detail(conn):
 
 def page_signals_manager(conn):
     st.header("Signals Manager")
-    tabs = st.tabs(["Signal Definitions", "Signal Values"])
+    tabs = st.tabs(["Signal Definitions", "Signal Values", "Agents"])
 
     with tabs[0]:
         st.subheader("Definitions")
+        st.caption("For per-signal agents, set automation_detail as JSON (role/goal/backstory) and automation_prompt for custom extraction instructions.")
         defs = db.list_signal_definitions(conn)
         if defs:
             df = pd.DataFrame([dict(d) for d in defs])
@@ -1275,6 +1288,141 @@ def page_signals_manager(conn):
                         ]
                     ]
                 )
+
+    with tabs[2]:
+        st.subheader("Agents")
+        st.caption("Each AI agent is tied to a signal. Edit the agent role, goal, backstory, tools, and prompt here.")
+        defs = db.list_signal_definitions(conn)
+        ai_defs = [dict(d) for d in defs if (d.get("automation_type") or "").lower() == "ai"]
+        rows = []
+        for d in ai_defs:
+            detail = d.get("automation_detail")
+            role = ""
+            goal = ""
+            backstory = ""
+            tools = ""
+            if isinstance(detail, dict):
+                role = detail.get("role") or ""
+                goal = detail.get("goal") or ""
+                backstory = detail.get("backstory") or ""
+                tools_val = detail.get("tools") or []
+                if isinstance(tools_val, list):
+                    tools = ", ".join([str(t).strip() for t in tools_val if str(t).strip()])
+                elif isinstance(tools_val, str):
+                    tools = tools_val
+            elif isinstance(detail, str) and detail.strip():
+                try:
+                    parsed = json.loads(detail)
+                    if isinstance(parsed, dict):
+                        role = parsed.get("role") or ""
+                        goal = parsed.get("goal") or ""
+                        backstory = parsed.get("backstory") or ""
+                        tools_val = parsed.get("tools") or []
+                        if isinstance(tools_val, list):
+                            tools = ", ".join([str(t).strip() for t in tools_val if str(t).strip()])
+                        elif isinstance(tools_val, str):
+                            tools = tools_val
+                    else:
+                        backstory = detail
+                except Exception:
+                    backstory = detail
+            rows.append(
+                {
+                    "signal_key": d.get("key"),
+                    "signal_name": d.get("name"),
+                    "role": role,
+                    "goal": goal,
+                    "backstory": backstory,
+                    "tools": tools,
+                    "prompt": d.get("automation_prompt") or "",
+                }
+            )
+
+        if rows:
+            base_df = pd.DataFrame(rows)
+        else:
+            base_df = pd.DataFrame(columns=["signal_key", "signal_name", "role", "goal", "backstory", "tools", "prompt"])
+
+        if "agents_df" not in st.session_state or st.button("Reset from database", key="agents_reset"):
+            st.session_state["agents_df"] = base_df
+
+        st.markdown("**Bulk edit**")
+        bulk_signals = st.multiselect(
+            "Select signals to update",
+            list(st.session_state["agents_df"]["signal_key"]) if not st.session_state["agents_df"].empty else [],
+            key="bulk_agent_signals",
+        )
+        bulk_prompt = st.text_area("Bulk prompt (leave blank to skip)", key="bulk_agent_prompt")
+        bulk_role = st.text_input("Bulk role (optional)", key="bulk_agent_role")
+        bulk_goal = st.text_input("Bulk goal (optional)", key="bulk_agent_goal")
+        bulk_backstory = st.text_area("Bulk backstory (optional)", key="bulk_agent_backstory")
+        bulk_tools = st.text_input("Bulk tools (comma-separated)", key="bulk_agent_tools")
+        if st.button("Apply bulk edits", key="apply_bulk_agents"):
+            df_bulk = st.session_state["agents_df"].copy()
+            for idx, row in df_bulk.iterrows():
+                if row["signal_key"] in bulk_signals:
+                    if bulk_prompt.strip():
+                        df_bulk.at[idx, "prompt"] = bulk_prompt.strip()
+                    if bulk_role.strip():
+                        df_bulk.at[idx, "role"] = bulk_role.strip()
+                    if bulk_goal.strip():
+                        df_bulk.at[idx, "goal"] = bulk_goal.strip()
+                    if bulk_backstory.strip():
+                        df_bulk.at[idx, "backstory"] = bulk_backstory.strip()
+                    if bulk_tools.strip():
+                        df_bulk.at[idx, "tools"] = bulk_tools.strip()
+            st.session_state["agents_df"] = df_bulk
+            st.experimental_rerun()
+
+        agent_editor = st.data_editor(
+            st.session_state["agents_df"],
+            num_rows="dynamic",
+            use_container_width=True,
+            disabled=["signal_key", "signal_name"],
+        )
+
+        if st.button("Save agent prompts", key="save_agents"):
+            edited = agent_editor.fillna("").to_dict(orient="records")
+            def_map = {d["key"]: dict(d) for d in defs}
+            updates = []
+            invalid = [r["signal_key"] for r in edited if not (r.get("prompt") or "").strip()]
+            if invalid:
+                st.error(f"Prompts required. Missing for: {', '.join(invalid)}")
+                return
+            for row in edited:
+                key = row.get("signal_key")
+                if not key or key not in def_map:
+                    continue
+                original = def_map[key]
+                detail = {
+                    "role": row.get("role") or "",
+                    "goal": row.get("goal") or "",
+                    "backstory": row.get("backstory") or "",
+                    "tools": [t.strip() for t in (row.get("tools") or "").split(",") if t.strip()],
+                }
+                if not any(detail.values()):
+                    detail_json = None
+                else:
+                    detail_json = json.dumps(detail)
+                updates.append(
+                    {
+                        "key": key,
+                        "name": original.get("name") or key,
+                        "description": original.get("description"),
+                        "value_type": original.get("value_type") or "text",
+                        "unit": original.get("unit"),
+                        "allowed_range_json": original.get("allowed_range_json"),
+                        "disabled": bool(original.get("disabled")),
+                        "automation_type": "ai",
+                        "automation_detail": detail_json,
+                        "automation_prompt": row.get("prompt") or None,
+                    }
+                )
+            if updates:
+                db.upsert_signal_definitions(conn, updates)
+                st.success("Agent prompts updated.")
+            else:
+                st.info("No agent updates to save.")
 
 
 def _validate_params_json(params_json):
@@ -1672,6 +1820,7 @@ def page_upload_crawl(conn):
 
     st.subheader("Founder Materials Upload & Extraction (RAG)")
     st.caption("Supported: PDF, TXT, EML, DOCX, PPTX. Files are stored in data/uploads/.")
+    use_ocr = st.checkbox("Use OCR for scanned PDFs (requires GCP creds)", value=False, key="fm_use_ocr")
     files = st.file_uploader("Upload founder materials", type=["pdf", "txt", "eml", "docx", "pptx"], accept_multiple_files=True, key="fm_upload")
     col1, col2 = st.columns(2)
     add_global = col1.checkbox("Add to global library", value=False, key="fm_global")
@@ -1703,6 +1852,7 @@ def page_upload_crawl(conn):
                         source_type="founder_material",
                         is_global=add_global,
                         company_id=fm_company_id,
+                        use_ocr=use_ocr,
                     )
                     st.success(f"Stored {file_obj.name} as document #{doc_id} ({pages} pages, {chunks} chunks)")
                     processed += 1

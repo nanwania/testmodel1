@@ -1,4 +1,5 @@
 import os
+import json
 from typing import List, Tuple
 
 import numpy as np
@@ -9,6 +10,13 @@ try:
     from pypdf import PdfReader
 except ImportError:  # pragma: no cover
     PdfReader = None
+
+try:
+    from google.cloud import vision
+    from google.cloud import storage
+except ImportError:  # pragma: no cover
+    vision = None
+    storage = None
 
 try:
     from docx import Document
@@ -51,6 +59,54 @@ def extract_pdf_pages(file_path: str) -> List[Tuple[int, str]]:
         text = " ".join(text.split())
         if text:
             pages.append((idx, text))
+    return pages
+
+
+def extract_pdf_pages_with_ocr(file_path: str) -> List[Tuple[int, str]]:
+    if vision is None or storage is None:
+        raise RuntimeError("google-cloud-vision/storage not installed")
+    bucket_name = os.getenv("GCP_OCR_BUCKET")
+    if not bucket_name:
+        raise RuntimeError("GCP_OCR_BUCKET is not set")
+
+    vision_client = vision.ImageAnnotatorClient()
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+
+    filename = os.path.basename(file_path)
+    upload_blob = bucket.blob(f"temp-uploads/{os.urandom(8).hex()}-{filename}")
+    upload_blob.upload_from_filename(file_path)
+
+    gcs_source_uri = f"gs://{bucket_name}/{upload_blob.name}"
+    gcs_dest_prefix = f"ocr-results/{os.urandom(8).hex()}-"
+    gcs_dest_uri = f"gs://{bucket_name}/{gcs_dest_prefix}"
+
+    request = {
+        "requests": [
+            {
+                "input_config": {"gcs_source": {"uri": gcs_source_uri}, "mime_type": "application/pdf"},
+                "features": [{"type_": vision.Feature.Type.DOCUMENT_TEXT_DETECTION}],
+                "output_config": {"gcs_destination": {"uri": gcs_dest_uri}, "batch_size": 100},
+            }
+        ]
+    }
+
+    operation = vision_client.async_batch_annotate_files(request)
+    operation.result(timeout=600)
+
+    pages = []
+    for blob in storage_client.list_blobs(bucket_name, prefix=gcs_dest_prefix):
+        content = blob.download_as_bytes()
+        result = json.loads(content.decode("utf-8"))
+        responses = result.get("responses", [])
+        for idx, response in enumerate(responses, start=1):
+            full = response.get("fullTextAnnotation", {}).get("text", "")
+            full = " ".join(full.split())
+            if full:
+                pages.append((idx, full))
+        blob.delete()
+
+    upload_blob.delete()
     return pages
 
 
@@ -167,12 +223,14 @@ def build_chunks(pages: List[Tuple[int, str]]):
     return chunks
 
 
-def store_document(conn, file_obj, filename, doc_type, source_type, is_global=False, company_id=None, actor="user"):
+def store_document(conn, file_obj, filename, doc_type, source_type, is_global=False, company_id=None, actor="user", use_ocr=False):
     storage_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "uploads")
     path = save_uploaded_file(file_obj, storage_dir, filename)
 
     if doc_type == "pdf":
         pages = extract_pdf_pages(path)
+        if not pages and use_ocr:
+            pages = extract_pdf_pages_with_ocr(path)
     elif doc_type == "txt":
         pages = extract_txt_pages(path)
     elif doc_type == "eml":

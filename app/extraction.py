@@ -244,6 +244,73 @@ def extract_signals_with_openai(
     return normalize_extracted_signals(data, allowed)
 
 
+def extract_single_signal_with_openai(
+    text: str,
+    signal_def: Dict[str, object],
+    model: str = DEFAULT_MODEL,
+    company_name: str | None = None,
+    agent_profile: Dict[str, str] | None = None,
+) -> Dict[str, Dict[str, object]]:
+    if OpenAI is None:
+        raise RuntimeError("openai package is not installed")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    client = OpenAI()
+
+    d = dict(signal_def)
+    key = d["key"]
+    name = d.get("name") or key
+    desc = d.get("description") or ""
+    value_type = d.get("value_type") or "text"
+    prompt = d.get("automation_prompt") or ""
+
+    profile = agent_profile or {}
+    role = profile.get("role") or f"{name} Signal Agent"
+    goal = profile.get("goal") or f"Extract the {name} signal for a startup from provided text."
+    backstory = profile.get("backstory") or "You are precise, evidence-driven, and only return values supported by the text."
+    extra_instructions = profile.get("prompt") or ""
+
+    system_msg = (
+        f"You are {role}. Goal: {goal}. Backstory: {backstory}. "
+        "Return a JSON object with only the requested key. "
+        "The value must be an object with fields: value, confidence, evidence, page. "
+        "confidence is between 0 and 1. evidence is a short quote from the text (<=20 words). "
+        "page is an integer if evidence comes from a [Page N] tag; otherwise null. "
+        "Use numbers for numeric values, booleans for true/false, and strings for text. "
+        "If a value is unknown, set value to null and confidence to 0."
+    )
+
+    short_text = _truncate(text)
+    company_line = f"Company: {company_name}." if company_name else ""
+    signal_line = f"Signal: {key} — {name}. Description: {desc}. Type: {value_type}."
+    custom = f"Custom instructions: {extra_instructions or prompt}." if (extra_instructions or prompt) else ""
+    user_msg = (
+        f"{company_line} {signal_line} {custom} "
+        "Extract only this signal and return JSON only. "
+        f"Text: {short_text}"
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+
+    content = response.choices[0].message.content
+    data = json.loads(content)
+    if not isinstance(data, dict):
+        raise RuntimeError("Model did not return a JSON object")
+
+    return normalize_extracted_signals(data, [key])
+
+
 def normalize_extracted_signals(data: Dict[str, object], allowed_keys) -> Dict[str, Dict[str, object]]:
     normalized = {}
     for key in allowed_keys:
