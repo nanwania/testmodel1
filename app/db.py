@@ -430,6 +430,20 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS company_highlights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            highlights_json TEXT NOT NULL,
+            model TEXT,
+            created_at TEXT NOT NULL,
+            created_by TEXT,
+            FOREIGN KEY(company_id) REFERENCES companies(id)
+        )
+        """
+    )
+
     conn.commit()
     _ensure_column(conn, "companies", "canonical_domain", "TEXT")
     _ensure_column(conn, "companies", "deleted_at", "TEXT")
@@ -1061,7 +1075,10 @@ def list_score_components(conn, company_id):
                c.missing_policy AS criterion_missing_policy,
                sv.confidence AS signal_confidence,
                sv.evidence_text AS signal_evidence,
-               sv.evidence_page AS signal_evidence_page
+               sv.evidence_page AS signal_evidence_page,
+               sv.signal_key AS signal_key,
+               sv.source_type AS signal_source_type,
+               sv.source_ref AS signal_source_ref
         FROM score_components sc
         JOIN score_items si ON si.id = sc.score_item_id
         JOIN score_runs sr ON sr.id = si.score_run_id
@@ -1472,6 +1489,32 @@ def list_activity_for_company(conn, company_id, limit=200):
         (company_id, limit),
     )
     return cur.fetchall()
+
+
+def add_company_highlights(conn, company_id, highlights, model=None, actor="system"):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO company_highlights (company_id, highlights_json, model, created_at, created_by)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (company_id, json.dumps(highlights), model, _utc_now(), actor),
+    )
+    conn.commit()
+
+
+def get_latest_company_highlights(conn, company_id):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM company_highlights
+        WHERE company_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (company_id,),
+    )
+    return cur.fetchone()
 
 
 def _ensure_default_risk_rules(conn):

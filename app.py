@@ -19,6 +19,7 @@ from app import criteria_ai
 from app import simple_benchmark
 from app import auto_update
 from app import discovery
+from app import highlights
 from app import agent_orchestrator
 
 
@@ -765,6 +766,29 @@ def page_simple(conn):
     score_item = db.list_latest_score_item(conn, company_id)
     if score_item:
         st.metric("Latest Score", round(score_item["normalized_total"] or score_item["total_score"] or 0.0, 4))
+
+    latest_highlights = db.get_latest_company_highlights(conn, company_id)
+    if latest_highlights:
+        try:
+            highlights_data = json.loads(latest_highlights["highlights_json"])
+        except Exception:
+            highlights_data = {}
+        risks = highlights_data.get("risks") or []
+        highs = highlights_data.get("highlights") or []
+        if risks:
+            st.write("Top Risks")
+            st.dataframe(pd.DataFrame(risks), use_container_width=True)
+        if highs:
+            st.write("Top Investment Highlights")
+            st.dataframe(pd.DataFrame(highs), use_container_width=True)
+
+    if st.button("Generate AI highlights", key="simple_hl_run"):
+        data, err = highlights.generate_highlights(conn, company_id, model=model, ai_budget_usd=ai_budget)
+        if err:
+            st.error(err)
+        else:
+            db.add_company_highlights(conn, company_id, data, model=model, actor="user")
+            st.success("Highlights generated.")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1118,6 +1142,38 @@ def page_company_detail(conn):
             st.info("No risk flags in latest intelligent scan.")
     else:
         st.info("No intelligent risk scans yet. Run Risk Detection.")
+
+    st.subheader("AI Highlights")
+    latest_highlights = db.get_latest_company_highlights(conn, company_id)
+    if latest_highlights:
+        try:
+            highlights_data = json.loads(latest_highlights["highlights_json"])
+        except Exception:
+            highlights_data = {}
+        risks = highlights_data.get("risks") or []
+        highs = highlights_data.get("highlights") or []
+        if risks:
+            st.write("Top Risks")
+            st.dataframe(pd.DataFrame(risks), use_container_width=True)
+        else:
+            st.info("No risks generated yet.")
+        if highs:
+            st.write("Top Investment Highlights")
+            st.dataframe(pd.DataFrame(highs), use_container_width=True)
+        else:
+            st.info("No highlights generated yet.")
+    else:
+        st.info("No AI highlights yet.")
+
+    hl_model = st.text_input("Highlights model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), key="hl_model")
+    hl_budget = st.number_input("Highlights AI budget (USD)", min_value=0.0, max_value=5.0, value=0.2, step=0.05, key="hl_budget")
+    if st.button("Generate AI highlights", key="hl_run"):
+        data, err = highlights.generate_highlights(conn, company_id, model=hl_model, ai_budget_usd=hl_budget)
+        if err:
+            st.error(err)
+        else:
+            db.add_company_highlights(conn, company_id, data, model=hl_model, actor="user")
+            st.success("Highlights generated.")
 
 
 def page_signals_manager(conn):
