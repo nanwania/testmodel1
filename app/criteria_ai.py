@@ -119,15 +119,27 @@ def run_ai_scoring(
         founder_chunks = []
         if include_founder_materials:
             founder_chunks = rag.get_company_chunks(conn, company_id, source_types=["founder_material"])
+        website_text = None
+        if include_website:
+            url = website_url or company["website"]
+            if url:
+                try:
+                    website_text, _ = extraction.crawl_site_text(url, max_pages=3, same_domain=True)
+                except Exception:
+                    website_text = None
         for d in ai_defs:
             key = d["key"]
             name = d.get("name") or key
             desc = d.get("description") or ""
             query = f"{company['name']} {name} {desc}".strip()
             agent_profile = _agent_profile_from_def(d)
+            tools = set([t.lower() for t in (agent_profile.get("tools") or [])])
+            allow_founder = include_founder_materials and (not tools or "founder_materials" in tools or "founder" in tools)
+            allow_site = include_website and (not tools or "company_website" in tools or "website" in tools)
+            allow_web = allow_web_fallback and (not tools or "web_search" in tools or "web" in tools)
 
             # Step 1: Try founder materials first. Only run web agents if not found.
-            if founder_chunks:
+            if founder_chunks and allow_founder:
                 top_chunks = rag.retrieve_top_chunks(founder_chunks, query, top_k=top_k)
                 founder_context = rag.build_context(top_chunks)
                 if founder_context:
@@ -191,8 +203,70 @@ def run_ai_scoring(
                             saved += 1
                             continue
 
+            # Step 2: Try company website text if enabled
+            if website_text and allow_site:
+                est_cost = _estimate_cost(website_text)
+                if total_est_cost + est_cost > ai_budget_usd:
+                    return saved, f"Estimated AI cost ${total_est_cost + est_cost:.4f} exceeds budget ${ai_budget_usd:.2f}"
+                total_est_cost += est_cost
+                try:
+                    signals = extraction.extract_single_signal_with_openai(
+                        website_text,
+                        d,
+                        model=model,
+                        company_name=company["name"],
+                        agent_profile=agent_profile,
+                    )
+                except Exception:
+                    signals = {}
+                payload = signals.get(key)
+                if payload is not None:
+                    value_num, value_text, value_bool, value_json, confidence, evidence, evidence_page = extraction.normalize_extracted_signal(
+                        payload, d["value_type"]
+                    )
+                    raw_value = payload.get("value") if isinstance(payload, dict) else payload
+                    if raw_value is not None:
+                        db.add_signal_value(
+                            conn,
+                            company_id,
+                            key,
+                            value_num,
+                            value_text,
+                            value_bool,
+                            value_json,
+                            source_type="company_website",
+                            source_ref=website_url or company["website"],
+                            notes=f"model={model};search_per_signal=yes;source=company_website",
+                            confidence=confidence,
+                            evidence_text=evidence,
+                            evidence_page=evidence_page,
+                        )
+                        try:
+                            db.add_activity(
+                                conn,
+                                "agent_signal",
+                                "company",
+                                company_id,
+                                {
+                                    "signal_key": key,
+                                    "status": "success",
+                                    "source": "company_website",
+                                    "source_ref": website_url or company["website"],
+                                    "evidence": evidence,
+                                    "confidence": confidence,
+                                    "agent_role": agent_profile.get("role"),
+                                    "agent_prompt": agent_profile.get("prompt"),
+                                    "agent_tools": agent_profile.get("tools"),
+                                },
+                                actor="agent",
+                            )
+                        except Exception:
+                            pass
+                        saved += 1
+                        continue
+
             # Step 2: Web search agent for this signal (only if founder materials had no value)
-            if not allow_web_fallback:
+            if not allow_web:
                 try:
                     db.add_activity(
                         conn,
@@ -202,7 +276,7 @@ def run_ai_scoring(
                         {
                             "signal_key": key,
                             "status": "failed",
-                            "reason": "founder_only_no_value",
+                            "reason": "web_tool_disabled" if allow_web_fallback else "founder_only_no_value",
                             "agent_role": agent_profile.get("role"),
                             "agent_prompt": agent_profile.get("prompt"),
                             "agent_tools": agent_profile.get("tools"),
