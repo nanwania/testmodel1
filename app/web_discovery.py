@@ -1,13 +1,15 @@
 import os
 import requests
 
+from app import secrets_store
+
 SERP_API_URL = "https://serpapi.com/search.json"
 
 
 def serpapi_search(query: str, num: int = 10, gl: str = "us", hl: str = "en"):
-    api_key = os.getenv("SERPAPI_API_KEY")
-    if not api_key:
+    if not secrets_store.ensure_serpapi_key():
         raise RuntimeError("SERPAPI_API_KEY is not set")
+    api_key = os.getenv("SERPAPI_API_KEY")
 
     params = {
         "q": query,

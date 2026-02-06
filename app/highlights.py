@@ -3,6 +3,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 from app import db
+from app import secrets_store
 
 try:
     from openai import OpenAI
@@ -65,8 +66,7 @@ def generate_highlights(
     if OpenAI is None:
         return None, "openai package is not installed"
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    if not secrets_store.ensure_openai_key():
         return None, "OPENAI_API_KEY is not set"
 
     client = OpenAI()

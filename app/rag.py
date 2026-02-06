@@ -65,9 +65,12 @@ def extract_pdf_pages(file_path: str) -> List[Tuple[int, str]]:
 def extract_pdf_pages_with_ocr(file_path: str) -> List[Tuple[int, str]]:
     if vision is None or storage is None:
         raise RuntimeError("google-cloud-vision/storage not installed")
-    bucket_name = os.getenv("GCP_OCR_BUCKET")
-    if not bucket_name:
+    from app import secrets_store
+    if not secrets_store.ensure_gcp_bucket():
         raise RuntimeError("GCP_OCR_BUCKET is not set")
+    bucket_name = os.getenv("GCP_OCR_BUCKET")
+    if not secrets_store.ensure_gcp_credentials():
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is not set")
 
     vision_client = vision.ImageAnnotatorClient()
     storage_client = storage.Client()

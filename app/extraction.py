@@ -21,6 +21,7 @@ try:
 except ImportError:  # pragma: no cover
     OpenAI = None
 
+from app import secrets_store
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_TIMEOUT = 20
@@ -188,8 +189,7 @@ def extract_signals_with_openai(
     if OpenAI is None:
         raise RuntimeError("openai package is not installed")
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    if not secrets_store.ensure_openai_key():
         raise RuntimeError("OPENAI_API_KEY is not set")
 
     client = OpenAI()
@@ -254,8 +254,7 @@ def extract_single_signal_with_openai(
     if OpenAI is None:
         raise RuntimeError("openai package is not installed")
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    if not secrets_store.ensure_openai_key():
         raise RuntimeError("OPENAI_API_KEY is not set")
 
     client = OpenAI()

@@ -21,6 +21,7 @@ from app import auto_update
 from app import discovery
 from app import highlights
 from app import agent_orchestrator
+from app import secrets_store
 
 
 def _utc_now():
@@ -691,105 +692,45 @@ def page_simple(conn):
             st.session_state["simple_company_id"] = company_id
     st.markdown("</div>", unsafe_allow_html=True)
 
-    companies = db.list_companies(conn)
-    if not companies:
-        st.info("Add a company to continue.")
+
+def page_settings():
+    st.title("Settings")
+    st.subheader("API Keys")
+    if not secrets_store.keyring_available():
+        st.warning("Keyring is not available. Install the dependency or use environment variables.")
+        st.code("pip install keyring")
         return
-    default_company_id = st.session_state.get("simple_company_id") or companies[0]["id"]
-    company_map = {f"{c['name']} (#{c['id']})": c["id"] for c in companies}
-    default_label = next((k for k, v in company_map.items() if v == default_company_id), list(company_map.keys())[0])
-    selected_label = st.selectbox("Active company", list(company_map.keys()), index=list(company_map.keys()).index(default_label), key="simple_company_select")
-    company_id = company_map[selected_label]
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("2) Run Agents on Founder Deck")
-    if st.button("Run founder-deck agents", key="simple_founder_agents"):
-        saved, err = criteria_ai.run_ai_scoring(
-            conn,
-            company_id,
-            model=model,
-            ai_budget_usd=ai_budget,
-            include_website=False,
-            include_founder_materials=True,
-            search_per_signal=True,
-            search_max_pages=0,
-            allow_web_fallback=False,
-        )
-        if err:
-            st.error(err)
-        else:
-            st.success(f"Saved {saved} signals from founder materials.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    key_rows = [
+        ("OPENAI_API_KEY", "OpenAI"),
+        ("SERPAPI_API_KEY", "SerpAPI"),
+        ("EXA_API_KEY", "EXA"),
+        ("PROXYCURL_API_KEY", "Proxycurl"),
+        ("GOOGLE_APPLICATION_CREDENTIALS", "GCP Credentials Path"),
+        ("GCP_OCR_BUCKET", "GCP OCR Bucket"),
+    ]
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("3) Run Agents on Web Sources")
-    search_pages = st.slider("Search pages per signal", min_value=1, max_value=5, value=3, key="simple_search_pages")
-    if st.button("Run web agents", key="simple_web_agents"):
-        saved, err = criteria_ai.run_ai_scoring(
-            conn,
-            company_id,
-            model=model,
-            ai_budget_usd=ai_budget,
-            include_website=False,
-            include_founder_materials=False,
-            search_per_signal=True,
-            search_max_pages=search_pages,
-            allow_web_fallback=True,
-        )
-        if err:
-            st.error(err)
-        else:
-            st.success(f"Saved {saved} signals from web sources.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("4) View Numbers Agents Found")
-    signals = db.list_latest_signal_values(conn, company_id)
-    if signals:
-        st.dataframe(
-            pd.DataFrame(signals)[
-                [
-                    "signal_key",
-                    "value_num",
-                    "value_text",
-                    "confidence",
-                    "evidence_text",
-                    "source_type",
-                    "source_ref",
-                    "observed_at",
-                ]
-            ],
-            use_container_width=True,
-        )
-    else:
-        st.info("No signals yet.")
-    score_item = db.list_latest_score_item(conn, company_id)
-    if score_item:
-        st.metric("Latest Score", round(score_item["normalized_total"] or score_item["total_score"] or 0.0, 4))
-
-    latest_highlights = db.get_latest_company_highlights(conn, company_id)
-    if latest_highlights:
-        try:
-            highlights_data = json.loads(latest_highlights["highlights_json"])
-        except Exception:
-            highlights_data = {}
-        risks = highlights_data.get("risks") or []
-        highs = highlights_data.get("highlights") or []
-        if risks:
-            st.write("Top Risks")
-            st.dataframe(pd.DataFrame(risks), use_container_width=True)
-        if highs:
-            st.write("Top Investment Highlights")
-            st.dataframe(pd.DataFrame(highs), use_container_width=True)
-
-    if st.button("Generate AI highlights", key="simple_hl_run"):
-        data, err = highlights.generate_highlights(conn, company_id, model=model, ai_budget_usd=ai_budget)
-        if err:
-            st.error(err)
-        else:
-            db.add_company_highlights(conn, company_id, data, model=model, actor="user")
-            st.success("Highlights generated.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    for env_name, label in key_rows:
+        stored = secrets_store.get_key(env_name)
+        status = "Stored in keychain" if stored else "Not stored"
+        st.markdown(f"**{label}** — {status}")
+        new_val = st.text_input(label, type="password", key=f"settings_{env_name}")
+        col1, col2 = st.columns(2)
+        if col1.button(f"Save {label}", key=f"save_{env_name}"):
+            if not new_val:
+                st.error("Enter a value first.")
+            else:
+                ok = secrets_store.set_key(env_name, new_val.strip())
+                if ok:
+                    st.success(f"{label} saved to keychain.")
+                else:
+                    st.error(f"Failed to save {label}.")
+        if col2.button(f"Remove {label}", key=f"remove_{env_name}"):
+            ok = secrets_store.delete_key(env_name)
+            if ok:
+                st.success(f"{label} removed from keychain.")
+            else:
+                st.info(f"No {label} to remove or removal failed.")
 
 
 def page_companies(conn):
@@ -2325,7 +2266,7 @@ def main():
     st.sidebar.title("Navigation")
     _render_run_tooltips()
     show_advanced = st.sidebar.checkbox("Show advanced pages", value=False)
-    pages = ["Simple Workflow"]
+    pages = ["Simple Workflow", "Settings"]
     if show_advanced:
         pages.extend(
             [
@@ -2345,6 +2286,8 @@ def main():
 
     if page == "Simple Workflow":
         page_simple(conn)
+    elif page == "Settings":
+        page_settings()
     elif page == "Dashboard":
         page_dashboard(conn)
     elif page == "Companies":
