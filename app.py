@@ -423,6 +423,92 @@ def seed_defaults(conn):
     ensure_signal_definitions(composite_defs)
 
 
+def ensure_excel_baseline(conn, excel_path: str):
+    if not os.path.exists(excel_path):
+        return
+
+    try:
+        mtime = os.path.getmtime(excel_path)
+    except OSError:
+        return
+
+    cur = conn.cursor()
+    cur.execute("SELECT id, active_version_id FROM criteria_sets WHERE name = ?", ("Default",))
+    row = cur.fetchone()
+    if not row:
+        return
+    active_id = row["active_version_id"]
+    if active_id:
+        cur.execute("SELECT notes FROM criteria_set_versions WHERE id = ?", (active_id,))
+        note_row = cur.fetchone()
+        notes = note_row["notes"] if note_row else None
+        stamp = f"excel_path={excel_path};excel_mtime={mtime}"
+        if notes and stamp in notes:
+            return
+
+    try:
+        parsed = criteria_import.parse_excel_criteria(excel_path)
+    except Exception:
+        return
+
+    defs = []
+    criteria_rows = []
+    for row in parsed:
+        automation_type = row.get("automation_type")
+        auto_detail = None
+        if automation_type == "ai":
+            auto_detail = json.dumps(
+                {
+                    "role": f"{row['name']} Signal Analyst",
+                    "goal": f"Extract {row['name']} for {row['theme']} / {row['subtheme']}",
+                    "backstory": "Evidence-driven. Return null if not found.",
+                }
+            )
+        defs.append(
+            {
+                "key": row["signal_key"],
+                "name": row["name"],
+                "description": f"{row['theme']} / {row['subtheme']}".strip(" /"),
+                "value_type": "number",
+                "unit": "score",
+                "allowed_range_json": json.dumps({"min": 0, "max": 5}),
+                "disabled": False,
+                "automation_type": automation_type,
+                "automation_detail": auto_detail,
+                "automation_prompt": None,
+            }
+        )
+        criteria_rows.append(
+            {
+                "name": row["name"],
+                "description": row.get("description") or row.get("subtheme"),
+                "signal_key": row["signal_key"],
+                "weight": float(row["weight"] or 0),
+                "enabled": True,
+                "scoring_method": "linear",
+                "params_json": json.dumps({"min": row.get("score_min", 0), "max": row.get("score_max", 5), "clamp": True}),
+                "missing_policy": "exclude",
+                "theme": row.get("theme"),
+                "subtheme": row.get("subtheme"),
+                "score_min": row.get("score_min", 0),
+                "score_max": row.get("score_max", 5),
+                "display_order": row.get("display_order"),
+            }
+        )
+
+    db.upsert_signal_definitions(conn, defs, actor="system")
+    if active_id:
+        new_version_id = db.replace_criteria_version(conn, active_id, criteria_rows, actor="system")
+        if new_version_id:
+            notes = f"excel_path={excel_path};excel_mtime={mtime};rows={len(criteria_rows)}"
+            cur.execute("UPDATE criteria_set_versions SET notes = ? WHERE id = ?", (notes, new_version_id))
+            conn.commit()
+            try:
+                db.add_activity(conn, "criteria_excel_baseline", None, None, {"path": excel_path, "rows": len(criteria_rows)}, actor="system")
+            except Exception:
+                pass
+
+
 def _auto_process_company(conn, company_id, website_url=None):
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     ai_budget = float(os.getenv("AI_BUDGET_USD", "0.2"))
@@ -2262,6 +2348,7 @@ def main():
     db.init_db()
     conn = db.get_conn()
     seed_defaults(conn)
+    ensure_excel_baseline(conn, os.path.join("data", "Quantitative Investment Checklist - ANON.xlsx"))
 
     st.sidebar.title("Navigation")
     _render_run_tooltips()
